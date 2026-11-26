@@ -22,7 +22,6 @@ constexpr int MAXELT = 8;
 namespace LAMMPS_NS {
 class Memory;
 
-
 class MEAM {
  public:
   MEAM(Memory *mem);
@@ -30,7 +29,23 @@ class MEAM {
 
   int copymode;
   int msmeamflag;
-  using lattice_t = enum { FCC, BCC, HCP, DIM, DIA, DIA3, B1, C11, L12, B2, CH4, LIN, ZIG, TRI, SC };
+  using lattice_t = enum {
+    FCC,
+    BCC,
+    HCP,
+    DIM,
+    DIA,
+    DIA3,
+    B1,
+    C11,
+    L12,
+    B2,
+    CH4,
+    LIN,
+    ZIG,
+    TRI,
+    SC
+  };
 
  protected:
   Memory *memory;
@@ -259,7 +274,8 @@ class MEAM {
                   double, double, double, double, double, int, int, lattice_t);
   void get_sijk(double, int, int, int, double *);
   void get_densref(double, int, int, double *, double *, double *, double *, double *, double *,
-                   double *, double *, double *, double *, double *, double *, double *, double *); // last 6 args for msmeam
+                   double *, double *, double *, double *, double *, double *, double *,
+                   double *);    // last 6 args for msmeam
   void interpolate_meam(int);
 
  public:
@@ -318,19 +334,32 @@ class MEAM {
                   double *eng_vdwl, double *eatom, int ntype, int *type, int *fmap, double **scale,
                   double **x, int numneigh, int *firstneigh, int numneigh_full,
                   int *firstneigh_full, int fnoffset, double **f, double **vatom, double *virial);
+
+  // read-only helpers for exact local energy changes of atom type swaps
+  // (see pair_swap_local.h).  they reproduce the energy terms of
+  // meam_dens_init(), meam_dens_final() and meam_force() for MEAM
+  // (not MS-MEAM) with element indices given explicitly.
+  // partial densities of one atom are stored in NSWAPDENS values:
+  // rho0, arho2b, arho1[3], arho2[6], arho3[10], arho3b[3], t_ave[3], tsq_ave[3]
+
+  enum { NSWAPDENS = 30 };
+  double swap_ebound_max() const;
+  double swap_cutoff() const { return cutforce; }
+  double swap_ebound(int elti, int eltj) const { return ebound_meam[elti][eltj]; }
+  void swap_screen(int i, int j, int elti, int eltj, const double *const *x, int numneigh_full,
+                   const int *firstneigh_full, const int *eltfull, double &sij, double &fcij) const;
+  void swap_pair(double scr, double fc, int elti, int eltj, const double *delij, double rij2,
+                 double scaleij, double sign, double &epair, double *densi) const;
+  double swap_embedding(const double *dens, int elti, double scaleii, int &errorflag) const;
 };
 
 // Functions we need for compat
 
 static inline bool iszero(const double f)
-{
-  return fabs(f) < 1e-20;
-}
+{ return fabs(f) < 1e-20; }
 
 static inline bool isone(const double f)
-{
-  return fabs(f - 1.0) < 1e-20;
-}
+{ return fabs(f - 1.0) < 1e-20; }
 
 // Helper functions
 

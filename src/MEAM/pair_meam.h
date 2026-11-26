@@ -21,10 +21,11 @@ PairStyle(meam,PairMEAM);
 #define LMP_PAIR_MEAM_H
 
 #include "pair.h"
+#include "pair_swap_local.h"
 
 namespace LAMMPS_NS {
 
-class PairMEAM : public Pair {
+class PairMEAM : public Pair, public PairSwapLocal {
  public:
   PairMEAM(class LAMMPS *);
   ~PairMEAM() override;
@@ -42,6 +43,15 @@ class PairMEAM : public Pair {
   void unpack_reverse_comm(int, int *, double *) override;
   double memory_usage() override;
 
+  // local energy changes for atom type swaps
+
+  PairSwapLocal *swap_local() override;
+  SwapLocalCaps swap_local_caps(std::string &) const override;
+  void swap_local_begin(class NeighList *) override;
+  int swap_local_delta_energy_batch(int, const SwapProposal *, double *) const override;
+  void swap_local_commit(const SwapProposal &) override;
+  void swap_local_end() override;
+
  protected:
   class MEAM *meam_inst;
   double cutmax;                           // max cutoff for all elements
@@ -58,6 +68,14 @@ class PairMEAM : public Pair {
   void read_global_meam_file(const std::string &);
   void read_user_meam_file(const std::string &, int);
   void neigh_strip(int, int *, int *, int **);
+
+  // data for local energy changes of atom type swaps.  only a pointer, so
+  // that copies made by derived accelerator styles stay cheap
+
+  class SwapLocalMEAM *swaplocal;
+
+  const double *swaplocal_dens_get(int, const SwapProposal &) const;
+  int swaplocal_core(const SwapProposal &, double &, int) const;
 };
 
 }    // namespace LAMMPS_NS

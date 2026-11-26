@@ -26,15 +26,38 @@
 #include "neigh_list.h"
 #include "neigh_request.h"
 #include "neighbor.h"
+#include "pair_swap_local.h"
 #include "potential_file_reader.h"
 
 #include <algorithm>
-#include <exception>
+#include <cmath>
 #include <cstring>
+#include <exception>
+#include <typeinfo>
 
 using namespace LAMMPS_NS;
 
 static constexpr int MAXLINE = 1024;
+
+namespace LAMMPS_NS {
+// per-invocation data for local energy changes of atom type swaps
+class SwapLocalMEAM {
+ public:
+  NeighList *list = nullptr;                // full neighbor list of owned atoms
+  SwapLocalCenters centers;                 // owned atoms near owned or ghost atoms
+  double rdepsq = 0.0;                      // squared dependency radius (with margin)
+  std::vector<double> dens;                 // cached partial densities of owned atoms
+  std::vector<unsigned char> dens_valid;    // 1 if dens of an owned atom is set
+  SwapLocalStamp stamp;                     // scratch: set of affected owned atoms
+  std::vector<int> affected;                // scratch: affected owned atoms
+  std::vector<double> ddens;                // scratch: their partial density changes
+  std::vector<int> eltold, eltnew;          // scratch: neighbor elements before/after
+  std::vector<int> simg;                    // scratch: neighbors that are edited atoms
+  std::vector<int> eltlazy;                 // scratch: neighbor elements in dens_get()
+  SwapProposal cached;                      // proposal the scratch data belongs to
+  int cached_valid = 0;                     // 1 if the scratch data is valid
+};
+}    // namespace LAMMPS_NS
 
 static const int nkeywords = 22;
 static const char *keywords[] = {
@@ -62,6 +85,7 @@ PairMEAM::PairMEAM(LAMMPS *lmp) : Pair(lmp)
   myname = "meam";
 
   scale = nullptr;
+  swaplocal = nullptr;
 }
 
 /* ----------------------------------------------------------------------
@@ -72,6 +96,8 @@ PairMEAM::PairMEAM(LAMMPS *lmp) : Pair(lmp)
 PairMEAM::~PairMEAM()
 {
   if (copymode) return;
+
+  delete swaplocal;
 
   delete meam_inst;
 
@@ -204,7 +230,7 @@ void PairMEAM::coeff(int narg, char **arg)
   if (narg < 6)
     utils::missing_cmd_args(FLERR, fmt::format("pair style {} coefficients", myname), error);
 
-// check for presence of first meam file
+  // check for presence of first meam file
 
   std::string lib_file = utils::get_potential_file_path(arg[2]);
   if (lib_file.empty()) {
@@ -234,13 +260,17 @@ void PairMEAM::coeff(int narg, char **arg)
   }
   if (paridx < 0) {
     if (msmeamflag)
-      error->all(FLERR, Error::NOPOINTER, "No MS-MEAM parameter file in pair coefficients" + utils::errorurl(21));
+      error->all(FLERR, Error::NOPOINTER,
+                 "No MS-MEAM parameter file in pair coefficients" + utils::errorurl(21));
     else
-      error->all(FLERR, Error::NOPOINTER, "No MEAM parameter file in pair coefficients" + utils::errorurl(21));
+      error->all(FLERR, Error::NOPOINTER,
+                 "No MEAM parameter file in pair coefficients" + utils::errorurl(21));
   }
   if ((narg - paridx - 1) != atom->ntypes)
-    error->all(FLERR, Error::NOPOINTER, "Expected {} but found {} args for pair style {} "
-               "coefficients", 1 + paridx + atom->ntypes, narg, myname);
+    error->all(FLERR, Error::NOPOINTER,
+               "Expected {} but found {} args for pair style {} "
+               "coefficients",
+               1 + paridx + atom->ntypes, narg, myname);
 
   // MEAM element names between 2 filenames
   // nlibelements = # of MEAM elements
@@ -252,11 +282,13 @@ void PairMEAM::coeff(int narg, char **arg)
   }
 
   nlibelements = paridx - 3;
-  if (nlibelements < 1) error->all(FLERR, "Incorrect args for pair coefficients" + utils::errorurl(21));
+  if (nlibelements < 1)
+    error->all(FLERR, "Incorrect args for pair coefficients" + utils::errorurl(21));
   if (nlibelements > MAXELT)
     error->all(FLERR,
                "Too many elements extracted from MEAM library (current limit: {}). "
-               "Increase 'MAXELT' in meam.h and recompile.", MAXELT);
+               "Increase 'MAXELT' in meam.h and recompile.",
+               MAXELT);
 
   for (int i = 0; i < nlibelements; i++) {
     if (std::any_of(libelements.begin(), libelements.end(), [&](const std::string &elem) {
@@ -897,4 +929,340 @@ void *PairMEAM::extract(const char *str, int &dim)
   dim = 2;
   if (strcmp(str, "scale") == 0) return (void *) scale;
   return nullptr;
+}
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps, see pair_swap_local.h
+   only enabled for this exact class (not for meam/ms or accelerator
+   variants), derived classes must opt in explicitly.
+------------------------------------------------------------------------- */
+
+PairSwapLocal *PairMEAM::swap_local()
+{
+  if (typeid(*this) != typeid(PairMEAM)) return nullptr;
+  return this;
+}
+
+/* ----------------------------------------------------------------------
+   the site energy E_c = F_c(rho_c) + 1/2 sum_j phi_cj(r_cj) S_cj depends on
+   the types of the neighbors within rc and of all atoms k screening a pair
+   c-j.  screening atoms satisfy r_ck^2 <= ebound * r_cj^2 (see getscreen()),
+   so the dependency radius is sqrt(ebound_max)*rc.  two edits interact
+   through a shared site energy, so the conflict radius is twice that.
+   compute() takes the screening atoms of a pair from the full neighbor list
+   of one of its atoms, the local energies from the list of the site atom.
+   both agree only if all possible screening atoms are inside the neighbor
+   list cutoff rc + skin.
+------------------------------------------------------------------------- */
+
+SwapLocalCaps PairMEAM::swap_local_caps(std::string &reason) const
+{
+  SwapLocalCaps caps;
+  caps.supported = 1;
+  caps.supports_charge = 1;    // energy does not depend on charges
+  caps.dependency_radius = 0.0;
+  caps.conflict_radius = 0.0;
+
+  if (typeid(*this) != typeid(PairMEAM)) {
+    caps.supported = 0;
+    reason = "derived pair style has not been validated for local swap energies";
+    return caps;
+  }
+  if (msmeamflag) {
+    caps.supported = 0;
+    reason = "MS-MEAM is not supported";
+    return caps;
+  }
+  if (!allocated) {
+    caps.supported = 0;
+    reason = "pair coefficients are not set";
+    return caps;
+  }
+  for (int itype = 1; itype <= atom->ntypes; itype++) {
+    if (map[itype] < 0) {
+      caps.supported = 0;
+      reason = "atom types mapped to NULL are not supported";
+      return caps;
+    }
+  }
+
+  const double rc = meam_inst->swap_cutoff();
+  const double ebmax = meam_inst->swap_ebound_max();
+  caps.dependency_radius = sqrt(ebmax) * rc;
+  caps.conflict_radius = 2.0 * caps.dependency_radius;
+
+  const double rlist = cutmax + neighbor->skin;
+  if (!(ebmax * rc * rc * (1.0 + 1.0e-10) < rlist * rlist)) {
+    caps.supported = 0;
+    reason = fmt::format("screening atoms up to a distance of {:.8g} are not all inside the "
+                         "neighbor list cutoff {:.8g}, increase the neighbor skin",
+                         caps.dependency_radius, rlist);
+  }
+  return caps;
+}
+
+/* ----------------------------------------------------------------------
+   set up the cache of partial densities of owned atoms, which are computed
+   on first use from the full neighbor list
+------------------------------------------------------------------------- */
+
+void PairMEAM::swap_local_begin(NeighList *full_list)
+{
+  delete swaplocal;
+  swaplocal = new SwapLocalMEAM;
+  const int nlocal = atom->nlocal;
+  const double rc = meam_inst->swap_cutoff();
+  swaplocal->list = full_list;
+  if (swaplocal->centers.setup(atom, full_list)) swaplocal->list = nullptr;
+  swaplocal->rdepsq = meam_inst->swap_ebound_max() * rc * rc * (1.0 + 1.0e-10);
+  swaplocal->dens.assign((std::size_t) nlocal * MEAM::NSWAPDENS, 0.0);
+  swaplocal->dens_valid.assign(nlocal, 0);
+  swaplocal->stamp.resize(nlocal);
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairMEAM::swap_local_end()
+{
+  delete swaplocal;
+  swaplocal = nullptr;
+}
+
+/* ----------------------------------------------------------------------
+   partial densities of owned atom c before proposal prop, computed on first
+   use from the full neighbor list of c, with the screening of each pair c-j
+   taken from the same list.  periodic images of c are separate list entries
+   and contribute separately, like in compute().  elements of edited atoms
+   are taken from prop.
+------------------------------------------------------------------------- */
+
+const double *PairMEAM::swaplocal_dens_get(int c, const SwapProposal &prop) const
+{
+  const int NDENS = MEAM::NSWAPDENS;
+  SwapLocalMEAM &data = *swaplocal;
+  double *dens = &data.dens[(std::size_t) c * NDENS];
+  if (data.dens_valid[c]) return dens;
+
+  const double *const *const x = atom->x;
+  const int *const type = atom->type;
+  const tagint *const tag = atom->tag;
+  const int nfull = data.list->numneigh[c];
+  const int *full = data.list->firstneigh[c];
+  const int elc = map[swap_local_oldtype(prop, tag[c], type[c])];
+  const double rc = meam_inst->swap_cutoff();
+  const double cutforcesq = rc * rc;
+
+  data.eltlazy.resize(nfull);
+  for (int kn = 0; kn < nfull; kn++) {
+    const int k = full[kn] & NEIGHMASK;
+    data.eltlazy[kn] = map[swap_local_oldtype(prop, tag[k], type[k])];
+  }
+
+  for (int n = 0; n < NDENS; n++) dens[n] = 0.0;
+  for (int jn = 0; jn < nfull; jn++) {
+    const int j = full[jn] & NEIGHMASK;
+    double delij[3];
+    delij[0] = x[j][0] - x[c][0];
+    delij[1] = x[j][1] - x[c][1];
+    delij[2] = x[j][2] - x[c][2];
+    const double rij2 = delij[0] * delij[0] + delij[1] * delij[1] + delij[2] * delij[2];
+    if (!(rij2 < cutforcesq)) continue;
+    double scr, fc, epair;
+    meam_inst->swap_screen(c, j, elc, data.eltlazy[jn], x, nfull, full, data.eltlazy.data(), scr,
+                           fc);
+    meam_inst->swap_pair(scr, fc, elc, data.eltlazy[jn], delij, rij2, 1.0, 1.0, epair, dens);
+  }
+  data.dens_valid[c] = 1;
+  return dens;
+}
+
+/* ----------------------------------------------------------------------
+   owner computes energy change of one proposal for the owned atoms of this
+   rank with site energies E_c = F_c(rho_c) + 1/2 sum_j phi_cj(r_cj) S_cj:
+   1) affected sites: owned images of edited atoms and owned atoms within
+      the dependency radius of a local or ghost image of an edited atom
+   2) for every pair c-j of an affected site c that has an edited atom as end
+      point or possible screening atom (bounding test of getscreen()), the
+      pair energy and density contributions to c before and after
+   3) embedding energy change of each affected site
+   results are left in the scratch data.  with energy = 0 only the density
+   changes are computed (for swap_local_commit()).  return 0 on success.
+------------------------------------------------------------------------- */
+
+int PairMEAM::swaplocal_core(const SwapProposal &prop, double &de, int energy) const
+{
+  const int NDENS = MEAM::NSWAPDENS;
+  const double *const *const x = atom->x;
+  const int *const type = atom->type;
+  const tagint *const tag = atom->tag;
+  const int *const sametag = atom->sametag;
+  const int nlocal = atom->nlocal;
+  const int *const numneigh = swaplocal->list->numneigh;
+  int **const firstneigh = swaplocal->list->firstneigh;
+  const double rc = meam_inst->swap_cutoff();
+  const double cutforcesq = rc * rc;
+  SwapLocalMEAM &data = *swaplocal;
+
+  data.stamp.reset();
+  data.affected.clear();
+  data.cached_valid = 0;
+  de = 0.0;
+
+  // affected owned sites
+
+  for (int s = 0; s < prop.count; s++) {
+    for (int a = atom->map(prop.tag[s]); a >= 0; a = sametag[a]) {
+      if ((a < nlocal) && data.stamp.insert(a)) data.affected.push_back(a);
+      const double xa = x[a][0];
+      const double ya = x[a][1];
+      const double za = x[a][2];
+      data.centers.for_each(a, [&](int c) {
+        if (data.stamp.contains(c)) return;
+        const double delx = x[c][0] - xa;
+        const double dely = x[c][1] - ya;
+        const double delz = x[c][2] - za;
+        if (delx * delx + dely * dely + delz * delz > data.rdepsq) return;
+        data.stamp.insert(c);
+        data.affected.push_back(c);
+      });
+    }
+  }
+  data.ddens.assign(data.affected.size() * NDENS, 0.0);
+
+  // changed pair terms of each affected site
+
+  for (std::size_t ic = 0; ic < data.affected.size(); ic++) {
+    const int c = data.affected[ic];
+    const int wc = swap_local_which(prop, tag[c]);
+    const int tcold = (wc < 0) ? type[c] : prop.oldtype[wc];
+    const int tcnew = (wc < 0) ? type[c] : prop.newtype[wc];
+    const int ecold = map[tcold];
+    const int ecnew = map[tcnew];
+
+    const int nfull = numneigh[c];
+    const int *full = firstneigh[c];
+    data.eltold.resize(nfull);
+    data.eltnew.resize(nfull);
+    data.simg.clear();
+    for (int kn = 0; kn < nfull; kn++) {
+      const int k = full[kn] & NEIGHMASK;
+      const int w = swap_local_which(prop, tag[k]);
+      if (w < 0) {
+        data.eltold[kn] = data.eltnew[kn] = map[type[k]];
+      } else {
+        data.eltold[kn] = map[prop.oldtype[w]];
+        data.eltnew[kn] = map[prop.newtype[w]];
+        data.simg.push_back(kn);
+      }
+    }
+
+    double *dc = &data.ddens[ic * NDENS];
+    double epair = 0.0;
+    for (int jn = 0; jn < nfull; jn++) {
+      const int j = full[jn] & NEIGHMASK;
+      double delij[3];
+      delij[0] = x[j][0] - x[c][0];
+      delij[1] = x[j][1] - x[c][1];
+      delij[2] = x[j][2] - x[c][2];
+      const double rij2 = delij[0] * delij[0] + delij[1] * delij[1] + delij[2] * delij[2];
+      if (!(rij2 < cutforcesq)) continue;
+
+      const int wj = swap_local_which(prop, tag[j]);
+      const int tjold = (wj < 0) ? type[j] : prop.oldtype[wj];
+      const int tjnew = (wj < 0) ? type[j] : prop.newtype[wj];
+      const int ejold = map[tjold];
+      const int ejnew = map[tjnew];
+
+      // pairs without edited end points change only if an edited atom
+      // passes the bounding test for screening atoms in getscreen()
+
+      if ((wc < 0) && (wj < 0)) {
+        if (data.simg.empty()) continue;
+        const double rbound = meam_inst->swap_ebound(ecold, ejold) * rij2;
+        bool changed = false;
+        for (const auto &kn : data.simg) {
+          const int k = full[kn] & NEIGHMASK;
+          const double delxjk = x[k][0] - x[j][0];
+          const double delyjk = x[k][1] - x[j][1];
+          const double delzjk = x[k][2] - x[j][2];
+          const double rjk2 = delxjk * delxjk + delyjk * delyjk + delzjk * delzjk;
+          if (rjk2 > rbound) continue;
+          const double delxik = x[k][0] - x[c][0];
+          const double delyik = x[k][1] - x[c][1];
+          const double delzik = x[k][2] - x[c][2];
+          const double rik2 = delxik * delxik + delyik * delyik + delzik * delzik;
+          if (rik2 > rbound) continue;
+          changed = true;
+          break;
+        }
+        if (!changed) continue;
+      }
+
+      double scr, fc, eold, enew;
+      meam_inst->swap_screen(c, j, ecold, ejold, x, nfull, full, data.eltold.data(), scr, fc);
+      meam_inst->swap_pair(scr, fc, ecold, ejold, delij, rij2, scale[tcold][tjold], -1.0, eold, dc);
+      meam_inst->swap_screen(c, j, ecnew, ejnew, x, nfull, full, data.eltnew.data(), scr, fc);
+      meam_inst->swap_pair(scr, fc, ecnew, ejnew, delij, rij2, scale[tcnew][tjnew], 1.0, enew, dc);
+      epair += 0.5 * (enew - eold);
+    }
+
+    // embedding energy change
+
+    if (energy) {
+      const double *dold = swaplocal_dens_get(c, prop);
+      double dnew[MEAM::NSWAPDENS];
+      for (int n = 0; n < NDENS; n++) dnew[n] = dold[n] + dc[n];
+      int errnew, errold;
+      const double fnew = meam_inst->swap_embedding(dnew, ecnew, scale[tcnew][tcnew], errnew);
+      const double fold = meam_inst->swap_embedding(dold, ecold, scale[tcold][tcold], errold);
+      if (errnew || errold) return 1;
+      de += epair + fnew - fold;
+    }
+  }
+  return 0;
+}
+
+/* ----------------------------------------------------------------------
+   the scratch data of a single proposal is kept, so swap_local_commit()
+   of the same proposal does not need to repeat the calculation
+------------------------------------------------------------------------- */
+
+int PairMEAM::swap_local_delta_energy_batch(int n, const SwapProposal *proposals, double *dE) const
+{
+  if (!swaplocal || !swaplocal->list) return 1;
+  for (int k = 0; k < n; k++)
+    if (swaplocal_core(proposals[k], dE[k], 1)) return 1;
+  if (n == 1) {
+    swaplocal->cached = proposals[0];
+    swaplocal->cached_valid = 1;
+  }
+  return 0;
+}
+
+/* ----------------------------------------------------------------------
+   update the cached partial densities of affected owned atoms.  densities
+   that were not computed yet are computed later from the then current types.
+------------------------------------------------------------------------- */
+
+void PairMEAM::swap_local_commit(const SwapProposal &accepted)
+{
+  const int NDENS = MEAM::NSWAPDENS;
+  if (!swaplocal || !swaplocal->list)
+    error->one(FLERR, Error::NOLASTLINE, "Pair style {} could not update local swap data", myname);
+
+  SwapLocalMEAM &data = *swaplocal;
+  if (!data.cached_valid || !swap_local_same_types(data.cached, accepted)) {
+    double de;
+    if (swaplocal_core(accepted, de, 0))
+      error->one(FLERR, Error::NOLASTLINE, "Pair style {} could not update local swap data",
+                 myname);
+  }
+  for (std::size_t ic = 0; ic < data.affected.size(); ic++) {
+    const int c = data.affected[ic];
+    if (!data.dens_valid[c]) continue;
+    double *dens = &data.dens[(std::size_t) c * NDENS];
+    const double *delta = &data.ddens[ic * NDENS];
+    for (int n = 0; n < NDENS; n++) dens[n] += delta[n];
+  }
+  data.cached_valid = 0;
 }
