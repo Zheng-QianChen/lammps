@@ -31,6 +31,7 @@
 #include "neighbor.h"
 
 #include <cmath>
+#include <typeinfo>
 
 using namespace LAMMPS_NS;
 
@@ -1031,6 +1032,351 @@ void PairMEAMKokkos<DeviceType>::update_meam_views()
   d_arho3m = meam_inst_kk->d_arho3m;
   d_arho2mb = meam_inst_kk->d_arho2mb;
   d_arho3mb = meam_inst_kk->d_arho3mb;
+}
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps (device owner-computes)
+------------------------------------------------------------------------- */
+
+template <class DeviceType> PairSwapLocal *PairMEAMKokkos<DeviceType>::swap_local()
+{
+  if (typeid(*this) != typeid(PairMEAMKokkos<DeviceType>)) return nullptr;
+  return this;
+}
+
+template <class DeviceType>
+SwapLocalCaps PairMEAMKokkos<DeviceType>::swap_local_caps(std::string &reason) const
+{
+  SwapLocalCaps caps;
+  caps.supported = 1;
+  caps.supports_charge = 1;
+  caps.dependency_radius = 0.0;
+  caps.conflict_radius = 0.0;
+
+  if (typeid(*this) != typeid(PairMEAMKokkos<DeviceType>)) {
+    caps.supported = 0;
+    reason = "derived pair style has not been validated for local swap energies";
+    return caps;
+  }
+  if (msmeamflag) {
+    caps.supported = 0;
+    reason = "MS-MEAM is not supported";
+    return caps;
+  }
+  if (!allocated) {
+    caps.supported = 0;
+    reason = "pair coefficients are not set";
+    return caps;
+  }
+  for (int itype = 1; itype <= atom->ntypes; itype++) {
+    if (map[itype] < 0) {
+      caps.supported = 0;
+      reason = "atom types mapped to NULL are not supported";
+      return caps;
+    }
+  }
+
+  const double rc = meam_inst->swap_cutoff();
+  const double ebmax = meam_inst->swap_ebound_max();
+  caps.dependency_radius = sqrt(ebmax) * rc;
+  caps.conflict_radius = 2.0 * caps.dependency_radius;
+
+  const double rlist = cutmax + neighbor->skin;
+  if (!(ebmax * rc * rc * (1.0 + 1.0e-10) < rlist * rlist)) {
+    caps.supported = 0;
+    reason = fmt::format("screening atoms up to a distance of {:.8g} are not all inside the "
+                         "neighbor list cutoff {:.8g}, increase the neighbor skin",
+                         caps.dependency_radius, rlist);
+  }
+  return caps;
+}
+
+template <class DeviceType> void PairMEAMKokkos<DeviceType>::swap_ensure_dens(int nlocal_need) const
+{
+  constexpr int NDENS = MeamSwapParams::NDENS;
+  if ((int) d_swap_dens.extent(0) < nlocal_need || (int) d_swap_dens.extent(1) < NDENS) {
+    const int cap = nlocal_need + nlocal_need / 4 + 1;
+    d_swap_dens = decltype(d_swap_dens)("meam:swap dens", cap, NDENS);
+    d_swap_dens_valid = typename AT::t_int_1d("meam:swap dens valid", cap);
+  } else if ((int) d_swap_dens_valid.extent(0) < nlocal_need) {
+    d_swap_dens_valid =
+        typename AT::t_int_1d("meam:swap dens valid", nlocal_need + nlocal_need / 4 + 1);
+  }
+}
+
+template <class DeviceType> void PairMEAMKokkos<DeviceType>::swap_local_begin(NeighList *full_list)
+{
+  swap_eval_valid = 0;
+  swap_eval_n = 0;
+  swap_list_kk = nullptr;
+  // A host fix can query this interface too.  Decline a list from another
+  // memory space so the caller can fall back to full energy evaluations.
+  if (!full_list || !full_list->kokkos || (full_list->execution_space != execution_space)) return;
+  swap_list_kk = static_cast<NeighListKokkos<DeviceType> *>(full_list);
+  if (swap_centers_kk.setup(atom, swap_list_kk)) swap_list_kk = nullptr;
+
+  const double rc = meam_inst->swap_cutoff();
+  swap_rdepsq = meam_inst->swap_ebound_max() * rc * rc * (1.0 + 1.0e-10);
+  if (!d_swap_params.data())
+    d_swap_params = Kokkos::View<MeamSwapParams, DeviceType>(
+        Kokkos::view_alloc("meam:swap params", Kokkos::WithoutInitializing));
+  auto h_params = Kokkos::create_mirror_view(d_swap_params);
+  meam_inst_kk->fill_swap_params(h_params());
+  Kokkos::deep_copy(d_swap_params, h_params);
+
+  const int nlocal_need = atom->nlocal;
+  swap_ensure_dens(nlocal_need);
+  if (nlocal_need > 0) {
+    Kokkos::deep_copy(Kokkos::subview(d_swap_dens_valid, Kokkos::pair<int, int>(0, nlocal_need)),
+                      0);
+  }
+  if (!d_swap_error.data()) d_swap_error = decltype(d_swap_error)("meam:swap error");
+
+  atomKK->sync(execution_space, X_MASK | TYPE_MASK | TAG_MASK);
+}
+
+template <class DeviceType> void PairMEAMKokkos<DeviceType>::swap_local_end()
+{
+  swap_list_kk = nullptr;
+  swap_eval_valid = 0;
+  swap_eval_n = 0;
+}
+
+template <class DeviceType>
+int PairMEAMKokkos<DeviceType>::swap_local_delta_energy_batch(int n, const SwapProposal *proposals,
+                                                              double *dE) const
+{
+  if (!swap_list_kk) return 1;
+  if (!n) return 0;
+
+  swap_images_kk.stage(atom, n, proposals);
+  swap_eval_n = n;
+  swap_eval_valid = 0;
+
+  atomKK->sync(execution_space, X_MASK | TYPE_MASK | TAG_MASK);
+  const auto sx = atomKK->k_x.template view<DeviceType>();
+  if (swap_affected_kk.build(n, swap_images_kk, swap_centers_kk, swap_list_kk, sx, atom->nlocal,
+                             swap_rdepsq))
+    return 1;
+
+  constexpr int NDENS = MeamSwapParams::NDENS;
+  const auto stype = atomKK->k_type.template view<DeviceType>();
+  const auto stag = atomKK->k_tag.template view<DeviceType>();
+  const auto smap = d_map;
+  const auto sscale = d_scale;
+  const auto num = swap_list_kk->d_numneigh;
+  const auto neighbors = swap_list_kk->d_neighbors;
+  const auto phirar = meam_inst_kk->d_phirar;
+  const auto phirar1 = meam_inst_kk->d_phirar1;
+  const auto phirar2 = meam_inst_kk->d_phirar2;
+  const auto phirar3 = meam_inst_kk->d_phirar3;
+  const Kokkos::View<const MeamSwapParams, DeviceType> d_params = d_swap_params;
+
+  const int na = swap_affected_kk.size;
+  if ((int) d_swap_ddens.extent(0) < na || (int) d_swap_ddens.extent(1) < NDENS) {
+    const int cap = Kokkos::max(na + na / 4 + 1, 1);
+    d_swap_ddens = decltype(d_swap_ddens)("meam:swap ddens", cap, NDENS);
+  }
+  if ((int) d_swap_energy.extent(0) < n) {
+    const int cap = n + n / 4 + 1;
+    d_swap_energy = decltype(d_swap_energy)("meam:swap energy", cap);
+    h_swap_energy = decltype(h_swap_energy)("meam:host swap energy", cap);
+  }
+  if (!d_swap_error.data()) d_swap_error = decltype(d_swap_error)("meam:swap error");
+  Kokkos::deep_copy(d_swap_energy, 0.0);
+  Kokkos::deep_copy(d_swap_error, 0);
+
+  const auto dens = d_swap_dens;
+  const auto dens_valid = d_swap_dens_valid;
+  const auto ddens = d_swap_ddens;
+  const auto energy_out = d_swap_energy;
+  const auto err = d_swap_error;
+  const auto centers = swap_affected_kk.d_atom;
+  const auto which = swap_affected_kk.d_proposal;
+  const auto props = swap_images_kk.d_proposals;
+  const auto img_offset = swap_images_kk.d_img_offset;
+  const auto img_atom = swap_images_kk.d_img_atom;
+
+  Kokkos::parallel_for(
+      "meam:swap delta energies", Kokkos::RangePolicy<DeviceType>(0, na), KOKKOS_LAMBDA(int s) {
+        const MeamSwapParams &params = d_params();
+        const int c = centers(s);
+        const int k = which(s);
+        const SwapProposal p = props(k);
+        const int wc = swap_kk_which(p, stag(c));
+        const int tcold = (wc < 0) ? stype(c) : p.oldtype[wc];
+        const int tcnew = (wc < 0) ? stype(c) : p.newtype[wc];
+        const int ecold = smap(tcold);
+        const int ecnew = smap(tcnew);
+        const int nfull = num(c);
+
+        if (!dens_valid(c)) {
+          double tmp[NDENS];
+          for (int m = 0; m < NDENS; m++) tmp[m] = 0.0;
+          for (int jn = 0; jn < nfull; jn++) {
+            const int j = neighbors(c, jn) & NEIGHMASK;
+            double delij[3] = {sx(j, 0) - sx(c, 0), sx(j, 1) - sx(c, 1), sx(j, 2) - sx(c, 2)};
+            const double rij2 = delij[0] * delij[0] + delij[1] * delij[1] + delij[2] * delij[2];
+            if (!(rij2 < params.cutforcesq)) continue;
+            const int ej = smap(swap_kk_oldtype(p, stag(j), stype(j)));
+            double scr, fc, epair;
+            meam_swap_screen(params, c, j, ecold, ej, sx, nfull, neighbors, smap, stype, stag, p, 0,
+                             scr, fc);
+            meam_swap_pair(params, scr, fc, ecold, ej, delij, rij2, 1.0, 1.0, epair, tmp, phirar,
+                           phirar1, phirar2, phirar3);
+          }
+          for (int m = 0; m < NDENS; m++) dens(c, m) = tmp[m];
+          dens_valid(c) = 1;
+        }
+
+        double dc[NDENS];
+        for (int m = 0; m < NDENS; m++) dc[m] = 0.0;
+        double epair_sum = 0.0;
+
+        for (int jn = 0; jn < nfull; jn++) {
+          const int j = neighbors(c, jn) & NEIGHMASK;
+          double delij[3] = {sx(j, 0) - sx(c, 0), sx(j, 1) - sx(c, 1), sx(j, 2) - sx(c, 2)};
+          const double rij2 = delij[0] * delij[0] + delij[1] * delij[1] + delij[2] * delij[2];
+          if (!(rij2 < params.cutforcesq)) continue;
+
+          const int wj = swap_kk_which(p, stag(j));
+          const int tjold = (wj < 0) ? stype(j) : p.oldtype[wj];
+          const int tjnew = (wj < 0) ? stype(j) : p.newtype[wj];
+          const int ejold = smap(tjold);
+          const int ejnew = smap(tjnew);
+
+          if ((wc < 0) && (wj < 0)) {
+            const double rbound = params.ebound_meam[ecold][ejold] * rij2;
+            int changed = 0;
+            for (int im = img_offset(k); im < img_offset(k + 1); ++im) {
+              const int ka = img_atom(im);
+              const double dxjk = sx(ka, 0) - sx(j, 0);
+              const double dyjk = sx(ka, 1) - sx(j, 1);
+              const double dzjk = sx(ka, 2) - sx(j, 2);
+              if (dxjk * dxjk + dyjk * dyjk + dzjk * dzjk > rbound) continue;
+              const double dxik = sx(ka, 0) - sx(c, 0);
+              const double dyik = sx(ka, 1) - sx(c, 1);
+              const double dzik = sx(ka, 2) - sx(c, 2);
+              if (dxik * dxik + dyik * dyik + dzik * dzik > rbound) continue;
+              changed = 1;
+              break;
+            }
+            if (!changed) continue;
+          }
+
+          double scr_old, scr_new, fc, eold, enew;
+          meam_swap_screen_both(params, c, j, ecold, ejold, ecnew, ejnew, sx, nfull, neighbors,
+                                smap, stype, stag, p, scr_old, scr_new, fc);
+          meam_swap_pair(params, scr_old, fc, ecold, ejold, delij, rij2,
+                         static_cast<double>(sscale(tcold, tjold)), -1.0, eold, dc, phirar, phirar1,
+                         phirar2, phirar3);
+          meam_swap_pair(params, scr_new, fc, ecnew, ejnew, delij, rij2,
+                         static_cast<double>(sscale(tcnew, tjnew)), 1.0, enew, dc, phirar, phirar1,
+                         phirar2, phirar3);
+          epair_sum += 0.5 * (enew - eold);
+        }
+
+        for (int m = 0; m < NDENS; m++) ddens(s, m) = dc[m];
+
+        double dnew[NDENS];
+        double dold_buf[NDENS];
+        for (int m = 0; m < NDENS; m++) {
+          dold_buf[m] = dens(c, m);
+          dnew[m] = dens(c, m) + dc[m];
+        }
+        int errnew = 0, errold = 0;
+        const double fnew = meam_swap_embedding(params, dnew, ecnew,
+                                                static_cast<double>(sscale(tcnew, tcnew)), errnew);
+        const double fold = meam_swap_embedding(params, dold_buf, ecold,
+                                                static_cast<double>(sscale(tcold, tcold)), errold);
+        if (errnew || errold) {
+          Kokkos::atomic_exchange(&err(), 1);
+          return;
+        }
+        Kokkos::atomic_add(&energy_out(k), epair_sum + fnew - fold);
+      });
+
+  int host_err = 0;
+  Kokkos::deep_copy(host_err, d_swap_error);
+  if (host_err) {
+    swap_eval_valid = 0;
+    return 1;
+  }
+
+  Kokkos::deep_copy(Kokkos::subview(h_swap_energy, Kokkos::pair<int, int>(0, n)),
+                    Kokkos::subview(d_swap_energy, Kokkos::pair<int, int>(0, n)));
+  for (int k = 0; k < n; ++k) dE[k] = h_swap_energy(k);
+  swap_eval_valid = 1;
+  swap_eval_n = n;
+  if ((int) swap_eval_proposals.extent(0) < n)
+    swap_eval_proposals = decltype(swap_eval_proposals)("meam:cached proposals", n + n / 4 + 1);
+  for (int k = 0; k < n; ++k) swap_eval_proposals(k) = proposals[k];
+  return 0;
+}
+
+template <class DeviceType>
+void PairMEAMKokkos<DeviceType>::swap_local_commit_batch(int n, const SwapProposal *proposals,
+                                                         const int *accepted)
+{
+  if (!swap_list_kk)
+    error->one(FLERR, Error::NOLASTLINE, "Pair style {} could not update local swap data", myname);
+  if (!n) return;
+
+  constexpr int NDENS = MeamSwapParams::NDENS;
+  int any = 0;
+  for (int k = 0; k < n; k++)
+    if (accepted[k]) any = 1;
+  if (!any) {
+    swap_eval_valid = 0;
+    return;
+  }
+
+  // Cached density deltas belong to the exact batch, including its order.
+  bool matching = swap_eval_valid && (swap_eval_n == n);
+  for (int k = 0; matching && (k < n); ++k)
+    matching = swap_local_same_types(proposals[k], swap_eval_proposals(k));
+  if (!matching) {
+    std::vector<double> unused(n);
+    if (swap_local_delta_energy_batch(n, proposals, unused.data()))
+      error->one(FLERR, Error::NOLASTLINE, "Pair style {} could not update local swap data",
+                 myname);
+  }
+
+  if ((int) d_swap_accepted.extent(0) < n) {
+    const int cap = n + n / 4 + 1;
+    d_swap_accepted = decltype(d_swap_accepted)("meam:swap accepted", cap);
+    h_swap_accepted = decltype(h_swap_accepted)("meam:host swap accepted", cap);
+  }
+  for (int k = 0; k < n; k++) h_swap_accepted(k) = accepted[k];
+  Kokkos::deep_copy(Kokkos::subview(d_swap_accepted, Kokkos::pair<int, int>(0, n)),
+                    Kokkos::subview(h_swap_accepted, Kokkos::pair<int, int>(0, n)));
+
+  const int na = swap_affected_kk.size;
+  const auto dens = d_swap_dens;
+  const auto dens_valid = d_swap_dens_valid;
+  const auto ddens = d_swap_ddens;
+  const auto centers = swap_affected_kk.d_atom;
+  const auto which = swap_affected_kk.d_proposal;
+  const auto acc = d_swap_accepted;
+
+  Kokkos::parallel_for(
+      "meam:swap commit apply", Kokkos::RangePolicy<DeviceType>(0, na), KOKKOS_LAMBDA(int s) {
+        const int k = which(s);
+        if (!acc(k)) return;
+        const int c = centers(s);
+        if (!dens_valid(c)) return;
+        for (int m = 0; m < NDENS; m++) dens(c, m) += ddens(s, m);
+      });
+
+  swap_eval_valid = 0;
+  swap_eval_n = 0;
+}
+
+template <class DeviceType>
+void PairMEAMKokkos<DeviceType>::swap_local_commit(const SwapProposal &accepted)
+{
+  int one = 1;
+  swap_local_commit_batch(1, &accepted, &one);
 }
 
 /* ---------------------------------------------------------------------- */

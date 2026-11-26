@@ -27,6 +27,9 @@ PairStyle(meam/kk/host,PairMEAMKokkos<LMPHostType>);
 #include "pair_kokkos.h"
 #include "pair_meam.h"
 #include "meam_kokkos.h"
+#include "meam_swap_local_kokkos.h"
+#include "neigh_list_kokkos.h"
+#include "pair_swap_local_kokkos.h"
 
 namespace LAMMPS_NS {
 
@@ -56,6 +59,14 @@ class PairMEAMKokkos : public PairMEAM, public KokkosBase {
   void init_style() override;
   double init_one(int, int) override;
   void reinit() override;
+
+  PairSwapLocal *swap_local() override;
+  SwapLocalCaps swap_local_caps(std::string &) const override;
+  void swap_local_begin(class NeighList *) override;
+  int swap_local_delta_energy_batch(int, const SwapProposal *, double *) const override;
+  void swap_local_commit(const SwapProposal &) override;
+  void swap_local_commit_batch(int, const SwapProposal *, const int *) override;
+  void swap_local_end() override;
 
 // NOLINTNEXTLINE
   KOKKOS_INLINE_FUNCTION
@@ -126,7 +137,26 @@ class PairMEAMKokkos : public PairMEAM, public KokkosBase {
   typename AT::t_kkfloat_1d d_arho2mb;
   typename AT::t_kkfloat_2d d_arho1m, d_arho2m, d_arho3m, d_arho3mb;
 
+  NeighListKokkos<DeviceType> *swap_list_kk = nullptr;
+  SwapLocalCentersKokkos<DeviceType> swap_centers_kk;
+  mutable SwapBatchImagesKokkos<DeviceType> swap_images_kk;
+  mutable SwapLocalAffectedKokkos<DeviceType> swap_affected_kk;
+  mutable Kokkos::View<double **, DeviceType> d_swap_dens;
+  mutable typename AT::t_int_1d d_swap_dens_valid;
+  mutable Kokkos::View<double **, DeviceType> d_swap_ddens;
+  mutable Kokkos::View<double *, DeviceType> d_swap_energy;
+  mutable Kokkos::View<double *, LMPPinnedHostType> h_swap_energy;
+  mutable Kokkos::View<int *, DeviceType> d_swap_accepted;
+  mutable Kokkos::View<int *, LMPPinnedHostType> h_swap_accepted;
+  mutable Kokkos::View<int, DeviceType> d_swap_error;
+  Kokkos::View<MeamSwapParams, DeviceType> d_swap_params;
+  mutable double swap_rdepsq = 0.0;
+  mutable int swap_eval_valid = 0;
+  mutable int swap_eval_n = 0;
+  mutable Kokkos::View<SwapProposal *, LMPPinnedHostType> swap_eval_proposals;
+
   void update_meam_views();
+  void swap_ensure_dens(int) const;
 
   friend void pair_virial_fdotr_compute<PairMEAMKokkos>(PairMEAMKokkos*);
 };

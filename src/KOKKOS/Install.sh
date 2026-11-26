@@ -388,6 +388,7 @@ action meam_funcs_kokkos.h meam_funcs.cpp
 action meam_impl_kokkos.h meam_impl.cpp
 action meam_kokkos.h meam.h
 action meam_setup_done_kokkos.h meam_setup_done.cpp
+action meam_swap_local_kokkos.h meam.h
 action memory_kokkos.h
 action min_cg_kokkos.cpp
 action min_cg_kokkos.h

@@ -24,6 +24,7 @@
 
 namespace LAMMPS_NS {
 
+struct MeamSwapParams;
 struct TagMEAMDensFinal {};
 template <int NEIGHFLAG> struct TagMEAMDensInit {
 };
@@ -79,6 +80,7 @@ template <class DeviceType> class MEAMKokkos : public MEAM {
   typename AT::t_kkacc_1d d_eatom;
 
  public:
+  void fill_swap_params(struct MeamSwapParams &) const;
   void meam_dens_setup(int, int, int) override;
   void meam_setup_done(double *) override;
   void meam_dens_init(int, int, typename AT::t_int_1d, typename AT::t_int_1d,
