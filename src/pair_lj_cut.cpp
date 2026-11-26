@@ -25,11 +25,13 @@
 #include "memory.h"
 #include "neigh_list.h"
 #include "neighbor.h"
+#include "pair_swap_local.h"
 #include "respa.h"
 #include "update.h"
 
 #include <cmath>
 #include <cstring>
+#include <typeinfo>
 
 using namespace LAMMPS_NS;
 using namespace MathConst;
@@ -38,7 +40,8 @@ using namespace MathConst;
 
 PairLJCut::PairLJCut(LAMMPS *lmp) :
     Pair(lmp), cut(nullptr), epsilon(nullptr), sigma(nullptr), lj1(nullptr), lj2(nullptr),
-    lj3(nullptr), lj4(nullptr), offset(nullptr), cut_respa(nullptr)
+    lj3(nullptr), lj4(nullptr), offset(nullptr), cut_respa(nullptr), swaplocal_list(nullptr),
+    swaplocal_centers(nullptr)
 {
   respa_enable = 1;
   born_matrix_enable = 1;
@@ -50,6 +53,8 @@ PairLJCut::PairLJCut(LAMMPS *lmp) :
 PairLJCut::~PairLJCut()
 {
   if (copymode) return;
+
+  delete swaplocal_centers;
 
   if (allocated) {
     memory->destroy(setflag);
@@ -443,7 +448,8 @@ void PairLJCut::settings(int narg, char **arg)
 
 void PairLJCut::coeff(int narg, char **arg)
 {
-  if (narg < 4 || narg > 5) error->all(FLERR, "Incorrect args for pair coefficients" + utils::errorurl(21));
+  if (narg < 4 || narg > 5)
+    error->all(FLERR, "Incorrect args for pair coefficients" + utils::errorurl(21));
   if (!allocated) allocate();
 
   int ilo, ihi, jlo, jhi;
@@ -703,4 +709,144 @@ void *PairLJCut::extract(const char *str, int &dim)
   if (strcmp(str, "epsilon") == 0) return (void *) epsilon;
   if (strcmp(str, "sigma") == 0) return (void *) sigma;
   return nullptr;
+}
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps, see pair_swap_local.h
+   only enabled for this exact class.  derived classes (accelerator
+   variants or styles with additional terms) must opt in explicitly.
+------------------------------------------------------------------------- */
+
+PairSwapLocal *PairLJCut::swap_local()
+{
+  if (typeid(*this) != typeid(PairLJCut)) return nullptr;
+  return this;
+}
+
+/* ----------------------------------------------------------------------
+   the site energy of atom c is 1/2 sum_j phi(r_cj), so it depends only on
+   atoms within the largest cutoff.  pair terms are additive, so two edits
+   are independent if no pair of their atoms is within the cutoff.
+------------------------------------------------------------------------- */
+
+SwapLocalCaps PairLJCut::swap_local_caps(std::string &reason) const
+{
+  SwapLocalCaps caps;
+  caps.supported = 1;
+  caps.supports_charge = 1;    // energy does not depend on charges
+  caps.dependency_radius = cutforce;
+  caps.conflict_radius = cutforce;
+
+  if (typeid(*this) != typeid(PairLJCut)) {
+    caps.supported = 0;
+    reason = "derived pair style has not been validated for local swap energies";
+  } else if (!allocated || (cutforce <= 0.0)) {
+    caps.supported = 0;
+    reason = "pair coefficients are not initialized";
+  } else if (tail_flag) {
+    caps.supported = 0;
+    reason = "pair_modify tail yes is not supported";
+  }
+  return caps;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairLJCut::swap_local_begin(NeighList *full_list)
+{
+  delete swaplocal_centers;
+  swaplocal_centers = new SwapLocalCenters;
+  swaplocal_list = full_list;
+  if (swaplocal_centers->setup(atom, full_list)) swaplocal_list = nullptr;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairLJCut::swap_local_end()
+{
+  swaplocal_list = nullptr;
+  delete swaplocal_centers;
+  swaplocal_centers = nullptr;
+}
+
+/* ----------------------------------------------------------------------
+   pair energy of atoms of type itype and jtype at distance^2 rsq,
+   including the energy offset of pair_modify shift yes
+------------------------------------------------------------------------- */
+
+double PairLJCut::swaplocal_pair(int itype, int jtype, double rsq) const
+{
+  if (rsq >= cutsq[itype][jtype]) return 0.0;
+  const double r2inv = 1.0 / rsq;
+  const double r6inv = r2inv * r2inv * r2inv;
+  return r6inv * (lj3[itype][jtype] * r6inv - lj4[itype][jtype]) - offset[itype][jtype];
+}
+
+/* ----------------------------------------------------------------------
+   owner computes energy changes with site energies E_c = 1/2 sum_j phi(r_cj)
+   for each local or ghost image a of an edited atom:
+   - if a is owned: change of E_a with all neighbors in their new types
+     (this includes other edited atoms and periodic images of a itself)
+   - for every unedited owned atom c with a in its list: 1/2 phi change of
+     the pair c-a, once per image a, so atoms near several images are exact
+   summed over all ranks every pair with at least one edited atom gets its
+   full energy change.  special bond factors are not applied, the caller
+   rejects setups with special bond exclusions.
+------------------------------------------------------------------------- */
+
+int PairLJCut::swap_local_delta_energy_batch(int n, const SwapProposal *proposals, double *dE) const
+{
+  if (!swaplocal_list) return 1;
+
+  const double *const *const x = atom->x;
+  const int *const type = atom->type;
+  const tagint *const tag = atom->tag;
+  const int *const sametag = atom->sametag;
+  const int nlocal = atom->nlocal;
+  const int *const numneigh = swaplocal_list->numneigh;
+  int **const firstneigh = swaplocal_list->firstneigh;
+
+  for (int k = 0; k < n; k++) {
+    const SwapProposal &p = proposals[k];
+    double de = 0.0;
+
+    for (int m = 0; m < p.count; m++) {
+      const int told = p.oldtype[m];
+      const int tnew = p.newtype[m];
+
+      for (int a = atom->map(p.tag[m]); a >= 0; a = sametag[a]) {
+        const double xa = x[a][0];
+        const double ya = x[a][1];
+        const double za = x[a][2];
+
+        if (a < nlocal) {
+          const int *jlist = firstneigh[a];
+          const int jnum = numneigh[a];
+          for (int jj = 0; jj < jnum; jj++) {
+            const int j = jlist[jj] & NEIGHMASK;
+            const double delx = xa - x[j][0];
+            const double dely = ya - x[j][1];
+            const double delz = za - x[j][2];
+            const double rsq = delx * delx + dely * dely + delz * delz;
+            const int w = swap_local_which(p, tag[j]);
+            const int jold = (w < 0) ? type[j] : p.oldtype[w];
+            const int jnew = (w < 0) ? type[j] : p.newtype[w];
+            de += 0.5 * (swaplocal_pair(tnew, jnew, rsq) - swaplocal_pair(told, jold, rsq));
+          }
+        }
+
+        swaplocal_centers->for_each(a, [&](int c) {
+          if (swap_local_which(p, tag[c]) >= 0) return;
+          const double delx = x[c][0] - xa;
+          const double dely = x[c][1] - ya;
+          const double delz = x[c][2] - za;
+          const double rsq = delx * delx + dely * dely + delz * delz;
+          const int tc = type[c];
+          de += 0.5 * (swaplocal_pair(tc, tnew, rsq) - swaplocal_pair(tc, told, rsq));
+        });
+      }
+    }
+    dE[k] = de;
+  }
+  return 0;
 }

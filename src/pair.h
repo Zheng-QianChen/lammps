@@ -225,6 +225,12 @@ class Pair : protected Pointers {
   virtual void *extract(const char *, int &) { return nullptr; }
   virtual void *extract_peratom(const char *, int &) { return nullptr; }
   virtual void swap_eam(double *, double **) {}
+
+  // optional interface for local energy changes of atom type swaps, see pair_swap_local.h
+  // a style must enable it explicitly; derived styles must not inherit support
+
+  virtual class PairSwapLocal *swap_local() { return nullptr; }
+
   virtual void reset_dt() {}
   virtual void min_xf_pointers(int, double **, double **) {}
   virtual void min_xf_get(int) {}
@@ -248,7 +254,7 @@ class Pair : protected Pointers {
   [[nodiscard]] bool did_tally_callback() const { return did_tally_flag != 0; }
 
  protected:
-  int instance_me;      // which Pair class instantiation I am
+  int instance_me;         // which Pair class instantiation I am
   int instance_index();    // position within the current simulation, for internal fix ids
   double special_lj[4];    // copied from force->special_lj for Kokkos
 

@@ -21,10 +21,11 @@ PairStyle(lj/cut,PairLJCut);
 #define LMP_PAIR_LJ_CUT_H
 
 #include "pair.h"
+#include "pair_swap_local.h"
 
 namespace LAMMPS_NS {
 
-class PairLJCut : public Pair {
+class PairLJCut : public Pair, public PairSwapLocal {
  public:
   PairLJCut(class LAMMPS *);
   ~PairLJCut() override;
@@ -47,6 +48,15 @@ class PairLJCut : public Pair {
   void compute_middle() override;
   void compute_outer(int, int) override;
 
+  // local energy changes for atom type swaps
+
+  PairSwapLocal *swap_local() override;
+  SwapLocalCaps swap_local_caps(std::string &) const override;
+  void swap_local_begin(class NeighList *) override;
+  int swap_local_delta_energy_batch(int, const SwapProposal *, double *) const override;
+  void swap_local_commit(const SwapProposal &) override {}
+  void swap_local_end() override;
+
  protected:
   double cut_global;
   double **cut;
@@ -54,7 +64,14 @@ class PairLJCut : public Pair {
   double **lj1, **lj2, **lj3, **lj4, **offset;
   double *cut_respa;
 
+  // data for local swap energies, only pointers so that copies made by derived
+  // accelerator styles stay cheap
+
+  class NeighList *swaplocal_list;              // full neighbor list
+  class SwapLocalCenters *swaplocal_centers;    // owned atoms near owned or ghost atoms
+
   virtual void allocate();
+  double swaplocal_pair(int, int, double) const;
 };
 
 }    // namespace LAMMPS_NS
