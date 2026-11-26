@@ -31,6 +31,7 @@
 #include "pair_kokkos.h"
 
 #include <cmath>
+#include <typeinfo>
 using namespace LAMMPS_NS;
 
 #ifdef KOKKOS_ENABLE_HIP
@@ -1253,6 +1254,462 @@ struct PairEAMKokkos<Kokkos::HIP>::policyInstance {
   }
 };
 #endif
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps, see pair_swap_local_kokkos.h
+   valid for eam/kk, eam/alloy/kk, eam/fs/kk and eam/he/kk, which share
+   compute().  only enabled for the exact class (see swap_local() overrides
+   in the derived classes).
+------------------------------------------------------------------------- */
+
+template <class DeviceType> PairSwapLocal *PairEAMKokkos<DeviceType>::swap_local()
+{
+  if (typeid(*this) != typeid(PairEAMKokkos<DeviceType>)) return nullptr;
+  return this;
+}
+
+template <class DeviceType>
+SwapLocalCaps PairEAMKokkos<DeviceType>::swap_local_caps(std::string &reason) const
+{
+  SwapLocalCaps caps = PairEAM::swap_local_caps(reason);
+  // Capabilities are queried before compute() initializes cutforcesq_kk.
+  const double device_cutsq = static_cast<double>(static_cast<KK_FLOAT>(cutforcesq));
+  caps.dependency_radius = sqrt(MAX(cutforcesq, device_cutsq));
+  caps.conflict_radius = 2.0 * caps.dependency_radius;
+  return caps;
+}
+
+/* ----------------------------------------------------------------------
+   set up reverse ghost centers and a lazy owned density cache.  densities
+   are computed on first use; no full-box density recompute at begin.
+------------------------------------------------------------------------- */
+
+template <class DeviceType> void PairEAMKokkos<DeviceType>::swap_local_begin(NeighList *full_list)
+{
+  swap_list_kk = nullptr;
+  // A host fix can query this interface too.  Decline a list from another
+  // memory space so the caller can fall back to full energy evaluations.
+  if (!full_list || !full_list->kokkos || (full_list->execution_space != execution_space)) return;
+  swap_list_kk = static_cast<NeighListKokkos<DeviceType> *>(full_list);
+  if (swap_centers_kk.setup(atom, swap_list_kk)) swap_list_kk = nullptr;
+
+  const int nlocal = atom->nlocal;
+  if ((int) d_swap_rho.extent(0) < nlocal) {
+    const int cap = nlocal + nlocal / 4 + 1;
+    d_swap_rho = decltype(d_swap_rho)("eam:swap rho", cap);
+    d_swap_rho_valid = decltype(d_swap_rho_valid)("eam:swap rho valid", cap);
+  }
+  if (nlocal)
+    Kokkos::deep_copy(Kokkos::subview(d_swap_rho_valid, Kokkos::pair<int, int>(0, nlocal)), 0);
+
+  cutforcesq_kk = static_cast<KK_FLOAT>(cutforcesq);
+  rhomax_kk = static_cast<KK_FLOAT>(rhomax);
+  rhomin_kk = static_cast<KK_FLOAT>(rhomin);
+  rdr_kk = static_cast<KK_FLOAT>(rdr);
+  rdrho_kk = static_cast<KK_FLOAT>(rdrho);
+
+  atomKK->sync(execution_space, X_MASK | TYPE_MASK | TAG_MASK);
+  k_scale.template sync<DeviceType>();
+}
+
+/* ---------------------------------------------------------------------- */
+
+template <class DeviceType> void PairEAMKokkos<DeviceType>::swap_local_end()
+{ swap_list_kk = nullptr; }
+
+/* ----------------------------------------------------------------------
+   device tables and scalars copied into the lambda (do not capture this)
+------------------------------------------------------------------------- */
+
+namespace {
+template <class DeviceType> struct SwapEAMTables {
+  using AT = ArrayTypes<DeviceType>;
+  using t_kkfloat_2d_n7 = typename Kokkos::DualView<KK_FLOAT **[7], DeviceType>::t_dev_const;
+
+  t_kkfloat_2d_n7 frho, rhor, z2r;
+  typename AT::t_int_1d type2frho;
+  typename AT::t_int_2d_dl type2rhor, type2z2r;
+  typename AT::t_kkfloat_2d scale;
+  KK_FLOAT rdr, rdrho, rhomax, rhomin, cutforcesq;
+  int nr, nrho, he_flag;
+
+  // NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  void r_index(const double r, int &m, double &p) const
+  {
+    p = r * static_cast<double>(rdr) + 1.0;
+    m = static_cast<int>(p);
+    m = MIN(m, nr - 1);
+    p -= m;
+    p = MIN(p, 1.0);
+  }
+
+  // NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  void embedding_index(const double rho_i, int &m, double &p) const
+  {
+    if (he_flag) {
+      p = (rho_i - static_cast<double>(rhomin)) * static_cast<double>(rdrho) + 1.0;
+      m = static_cast<int>(p);
+      m = MAX(2, MIN(m, nrho - 1));
+      p -= m;
+      p = MAX(-1.0, MIN(p, 1.0));
+    } else {
+      p = rho_i * static_cast<double>(rdrho) + 1.0;
+      m = static_cast<int>(p);
+      m = MAX(1, MIN(m, nrho - 1));
+      p -= m;
+      p = MIN(p, 1.0);
+    }
+  }
+
+  // NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  double spline6(const t_kkfloat_2d_n7 &table, const int row, const int m, const double p) const
+  {
+    return ((static_cast<double>(table(row, m, 3)) * p + static_cast<double>(table(row, m, 4))) *
+                p +
+            static_cast<double>(table(row, m, 5))) *
+        p +
+        static_cast<double>(table(row, m, 6));
+  }
+
+  // NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  double spline_fp(const int row, const int m, const double p) const
+  {
+    return (static_cast<double>(frho(row, m, 0)) * p + static_cast<double>(frho(row, m, 1))) * p +
+        static_cast<double>(frho(row, m, 2));
+  }
+
+  // NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  double embed(const int itype, const double rhoi) const
+  {
+    int m;
+    double p;
+    embedding_index(rhoi, m, p);
+    const int row = type2frho(itype);
+    const double fpi = spline_fp(row, m, p);
+    double phi = spline6(frho, row, m, p);
+    if (he_flag && (rhoi < static_cast<double>(rhomin)))
+      phi += fpi * (rhoi - static_cast<double>(rhomin));
+    else if (rhoi > static_cast<double>(rhomax))
+      phi += fpi * (rhoi - static_cast<double>(rhomax));
+    return phi * static_cast<double>(scale(itype, itype));
+  }
+
+  // NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  double rhor_val(const int jtype, const int itype, const int m, const double p) const
+  { return spline6(rhor, type2rhor(jtype, itype), m, p); }
+
+  // NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  double z2r_val(const int itype, const int jtype, const int m, const double p) const
+  { return spline6(z2r, type2z2r(itype, jtype), m, p); }
+};
+}    // namespace
+
+/* ----------------------------------------------------------------------
+   stage all proposals once, build affected owned centers, and launch one
+   parallel kernel.  each owned center belongs to one proposal; threads
+   atomically sum partial dE(k).  densities of affected centers are filled
+   lazily into the persistent cache.
+------------------------------------------------------------------------- */
+
+template <class DeviceType>
+int PairEAMKokkos<DeviceType>::swap_local_delta_energy_batch(int n, const SwapProposal *proposals,
+                                                             double *dE) const
+{
+  if (!swap_list_kk) return 1;
+  if (!n) return 0;
+
+  atomKK->sync(execution_space, X_MASK | TYPE_MASK | TAG_MASK);
+
+  const auto sx = atomKK->k_x.template view<DeviceType>();
+  const auto stype = atomKK->k_type.template view<DeviceType>();
+  const auto stag = atomKK->k_tag.template view<DeviceType>();
+  const int nlocal = atom->nlocal;
+
+  swap_images_kk.stage(atom, n, proposals);
+  if (swap_affected_kk.build(n, swap_images_kk, swap_centers_kk, swap_list_kk, sx, nlocal,
+                             cutforcesq))
+    return 1;
+
+  if ((int) d_swap_energy.extent(0) < n) {
+    d_swap_energy = decltype(d_swap_energy)("eam:swap energy", n + n / 4 + 1);
+    h_swap_energy = decltype(h_swap_energy)("eam:host swap energy", d_swap_energy.extent(0));
+  }
+  Kokkos::deep_copy(d_swap_energy, 0.0);
+
+  SwapEAMTables<DeviceType> tables;
+  tables.frho = d_frho_spline;
+  tables.rhor = d_rhor_spline;
+  tables.z2r = d_z2r_spline;
+  tables.type2frho = d_type2frho;
+  tables.type2rhor = d_type2rhor;
+  tables.type2z2r = d_type2z2r;
+  tables.scale = d_scale;
+  tables.rdr = rdr_kk;
+  tables.rdrho = rdrho_kk;
+  tables.rhomax = rhomax_kk;
+  tables.rhomin = rhomin_kk;
+  tables.cutforcesq = cutforcesq_kk;
+  tables.nr = nr;
+  tables.nrho = nrho;
+  tables.he_flag = he_flag;
+
+  const auto energy = d_swap_energy;
+  const auto centers = swap_affected_kk.d_atom;
+  const auto which = swap_affected_kk.d_proposal;
+  const auto props = swap_images_kk.d_proposals;
+  const auto img_offset = swap_images_kk.d_img_offset;
+  const auto img_atom = swap_images_kk.d_img_atom;
+  const auto img_slot = swap_images_kk.d_img_slot;
+  const auto num = swap_list_kk->d_numneigh;
+  const auto neighbors = swap_list_kk->d_neighbors;
+  const auto rho = d_swap_rho;
+  const auto rho_valid = d_swap_rho_valid;
+
+  Kokkos::parallel_for(
+      "eam:swap owned energies", Kokkos::RangePolicy<DeviceType>(0, swap_affected_kk.size),
+      KOKKOS_LAMBDA(int s) {
+        const int c = centers(s);
+        const int k = which(s);
+        const SwapProposal p = props(k);
+        const int w_c = swap_kk_which(p, stag(c));
+
+        // lazy old density of this owned center (one thread owns c)
+
+        if (!rho_valid(c)) {
+          const int itype = swap_kk_oldtype(p, stag(c), stype(c));
+          double rhoi = 0.0;
+          const double xtmp = sx(c, 0);
+          const double ytmp = sx(c, 1);
+          const double ztmp = sx(c, 2);
+          for (int jj = 0; jj < num(c); ++jj) {
+            const int j = neighbors(c, jj) & NEIGHMASK;
+            const double delx = xtmp - sx(j, 0);
+            const double dely = ytmp - sx(j, 1);
+            const double delz = ztmp - sx(j, 2);
+            const double rsq = delx * delx + dely * dely + delz * delz;
+            if (rsq >= static_cast<double>(tables.cutforcesq)) continue;
+            const double r = Kokkos::sqrt(rsq);
+            int m;
+            double pp;
+            tables.r_index(r, m, pp);
+            const int jtype = swap_kk_oldtype(p, stag(j), stype(j));
+            rhoi += tables.rhor_val(jtype, itype, m, pp);
+          }
+          rho(c) = rhoi;
+          rho_valid(c) = 1;
+        }
+        const double rho_old = rho(c);
+
+        double de = 0.0;
+        if (w_c >= 0) {
+          // owned image of an edited atom: full new density and half pair terms
+
+          const int told = p.oldtype[w_c];
+          const int tnew = p.newtype[w_c];
+          double rhoa = 0.0;
+          double epair = 0.0;
+          const double xa = sx(c, 0);
+          const double ya = sx(c, 1);
+          const double za = sx(c, 2);
+          for (int jj = 0; jj < num(c); ++jj) {
+            const int j = neighbors(c, jj) & NEIGHMASK;
+            const double delx = xa - sx(j, 0);
+            const double dely = ya - sx(j, 1);
+            const double delz = za - sx(j, 2);
+            const double rsq = delx * delx + dely * dely + delz * delz;
+            if (rsq >= static_cast<double>(tables.cutforcesq)) continue;
+            const int jold = swap_kk_oldtype(p, stag(j), stype(j));
+            const int jnew = swap_kk_newtype(p, stag(j), stype(j));
+            const double r = Kokkos::sqrt(rsq);
+            int m;
+            double pp;
+            tables.r_index(r, m, pp);
+            rhoa += tables.rhor_val(jnew, tnew, m, pp);
+            const double recip = 1.0 / r;
+            const double phinew = tables.z2r_val(tnew, jnew, m, pp);
+            const double phiold = tables.z2r_val(told, jold, m, pp);
+            epair += 0.5 *
+                (static_cast<double>(tables.scale(tnew, jnew)) * phinew -
+                 static_cast<double>(tables.scale(told, jold)) * phiold) *
+                recip;
+          }
+          de = epair + tables.embed(tnew, rhoa) - tables.embed(told, rho_old);
+        } else {
+          // unedited owned atom near one or more images of the proposal
+
+          const int tc = stype(c);
+          double drho = 0.0;
+          double dpair = 0.0;
+          for (int im = img_offset(k); im < img_offset(k + 1); ++im) {
+            const int a = img_atom(im);
+            const int slot = img_slot(im);
+            const int told = p.oldtype[slot];
+            const int tnew = p.newtype[slot];
+            const double delx = sx(c, 0) - sx(a, 0);
+            const double dely = sx(c, 1) - sx(a, 1);
+            const double delz = sx(c, 2) - sx(a, 2);
+            const double rsq = delx * delx + dely * dely + delz * delz;
+            if (rsq >= static_cast<double>(tables.cutforcesq)) continue;
+            const double r = Kokkos::sqrt(rsq);
+            int m;
+            double pp;
+            tables.r_index(r, m, pp);
+            drho += tables.rhor_val(tnew, tc, m, pp) - tables.rhor_val(told, tc, m, pp);
+            const double phinew = tables.z2r_val(tc, tnew, m, pp);
+            const double phiold = tables.z2r_val(tc, told, m, pp);
+            dpair += 0.5 *
+                (static_cast<double>(tables.scale(tc, tnew)) * phinew -
+                 static_cast<double>(tables.scale(tc, told)) * phiold) /
+                r;
+          }
+          de = dpair + tables.embed(tc, rho_old + drho) - tables.embed(tc, rho_old);
+        }
+        Kokkos::atomic_add(&energy(k), de);
+      });
+
+  Kokkos::deep_copy(Kokkos::subview(h_swap_energy, Kokkos::pair<int, int>(0, n)),
+                    Kokkos::subview(d_swap_energy, Kokkos::pair<int, int>(0, n)));
+  for (int k = 0; k < n; ++k) dE[k] = h_swap_energy(k);
+  return 0;
+}
+
+/* ---------------------------------------------------------------------- */
+
+template <class DeviceType>
+void PairEAMKokkos<DeviceType>::swap_local_commit(const SwapProposal &accepted)
+{
+  const int one = 1;
+  swap_local_commit_batch(1, &accepted, &one);
+}
+
+/* ----------------------------------------------------------------------
+   update the lazy density cache for every accepted proposal of the batch
+   in one device launch.  atom types are already the new types, so all
+   lookups use the proposal old/new overrides.
+------------------------------------------------------------------------- */
+
+template <class DeviceType>
+void PairEAMKokkos<DeviceType>::swap_local_commit_batch(int n, const SwapProposal *proposals,
+                                                        const int *accepted)
+{
+  if (!swap_list_kk)
+    error->one(FLERR, Error::NOLASTLINE, "Pair style {} could not update local swap data",
+               force->pair_style);
+
+  std::vector<SwapProposal> acc;
+  acc.reserve(n);
+  for (int k = 0; k < n; ++k)
+    if (accepted[k]) acc.push_back(proposals[k]);
+  const int nacc = static_cast<int>(acc.size());
+  if (!nacc) return;
+
+  cutforcesq_kk = static_cast<KK_FLOAT>(cutforcesq);
+  rdr_kk = static_cast<KK_FLOAT>(rdr);
+
+  atomKK->sync(execution_space, X_MASK | TYPE_MASK | TAG_MASK);
+  k_scale.template sync<DeviceType>();
+
+  const auto sx = atomKK->k_x.template view<DeviceType>();
+  const auto stype = atomKK->k_type.template view<DeviceType>();
+  const auto stag = atomKK->k_tag.template view<DeviceType>();
+  const int nlocal = atom->nlocal;
+
+  swap_images_kk.stage(atom, nacc, acc.data());
+  if (swap_affected_kk.build(nacc, swap_images_kk, swap_centers_kk, swap_list_kk, sx, nlocal,
+                             cutforcesq)) {
+    // Discard the cache so the next trial recomputes current densities.
+    Kokkos::deep_copy(d_swap_rho_valid, 0);
+    return;
+  }
+
+  SwapEAMTables<DeviceType> tables;
+  tables.frho = d_frho_spline;
+  tables.rhor = d_rhor_spline;
+  tables.z2r = d_z2r_spline;
+  tables.type2frho = d_type2frho;
+  tables.type2rhor = d_type2rhor;
+  tables.type2z2r = d_type2z2r;
+  tables.scale = d_scale;
+  tables.rdr = rdr_kk;
+  tables.rdrho = rdrho_kk;
+  tables.rhomax = rhomax_kk;
+  tables.rhomin = rhomin_kk;
+  tables.cutforcesq = cutforcesq_kk;
+  tables.nr = nr;
+  tables.nrho = nrho;
+  tables.he_flag = he_flag;
+
+  const auto centers = swap_affected_kk.d_atom;
+  const auto which = swap_affected_kk.d_proposal;
+  const auto props = swap_images_kk.d_proposals;
+  const auto img_offset = swap_images_kk.d_img_offset;
+  const auto img_atom = swap_images_kk.d_img_atom;
+  const auto img_slot = swap_images_kk.d_img_slot;
+  const auto num = swap_list_kk->d_numneigh;
+  const auto neighbors = swap_list_kk->d_neighbors;
+  const auto rho = d_swap_rho;
+  const auto rho_valid = d_swap_rho_valid;
+
+  Kokkos::parallel_for(
+      "eam:swap commit densities", Kokkos::RangePolicy<DeviceType>(0, swap_affected_kk.size),
+      KOKKOS_LAMBDA(int s) {
+        const int c = centers(s);
+        const int k = which(s);
+        const SwapProposal p = props(k);
+        const int w_c = swap_kk_which(p, stag(c));
+
+        if (w_c >= 0) {
+          const int tnew = p.newtype[w_c];
+          double rhoa = 0.0;
+          const double xa = sx(c, 0);
+          const double ya = sx(c, 1);
+          const double za = sx(c, 2);
+          for (int jj = 0; jj < num(c); ++jj) {
+            const int j = neighbors(c, jj) & NEIGHMASK;
+            const double delx = xa - sx(j, 0);
+            const double dely = ya - sx(j, 1);
+            const double delz = za - sx(j, 2);
+            const double rsq = delx * delx + dely * dely + delz * delz;
+            if (rsq >= static_cast<double>(tables.cutforcesq)) continue;
+            const int jnew = swap_kk_newtype(p, stag(j), stype(j));
+            const double r = Kokkos::sqrt(rsq);
+            int m;
+            double pp;
+            tables.r_index(r, m, pp);
+            rhoa += tables.rhor_val(jnew, tnew, m, pp);
+          }
+          rho(c) = rhoa;
+          rho_valid(c) = 1;
+        } else if (rho_valid(c)) {
+          const int tc = swap_kk_oldtype(p, stag(c), stype(c));
+          double drho = 0.0;
+          for (int im = img_offset(k); im < img_offset(k + 1); ++im) {
+            const int a = img_atom(im);
+            const int slot = img_slot(im);
+            const int told = p.oldtype[slot];
+            const int tnew = p.newtype[slot];
+            const double delx = sx(c, 0) - sx(a, 0);
+            const double dely = sx(c, 1) - sx(a, 1);
+            const double delz = sx(c, 2) - sx(a, 2);
+            const double rsq = delx * delx + dely * dely + delz * delz;
+            if (rsq >= static_cast<double>(tables.cutforcesq)) continue;
+            const double r = Kokkos::sqrt(rsq);
+            int m;
+            double pp;
+            tables.r_index(r, m, pp);
+            drho += tables.rhor_val(tnew, tc, m, pp) - tables.rhor_val(told, tc, m, pp);
+          }
+          rho(c) += drho;
+        }
+      });
+}
 
 /* ---------------------------------------------------------------------- */
 

@@ -26,6 +26,8 @@
 #include "tune_kokkos.h"
 #include "update.h"
 
+#include <typeinfo>
+
 using namespace LAMMPS_NS;
 
 /* ---------------------------------------------------------------------- */
@@ -263,6 +265,111 @@ double PairLJCutKokkos<DeviceType>::init_one(int i, int j)
   k_params.modify_host();
 
   return cutone;
+}
+
+template <class DeviceType> PairSwapLocal *PairLJCutKokkos<DeviceType>::swap_local()
+{ return (typeid(*this) == typeid(PairLJCutKokkos<DeviceType>)) ? this : nullptr; }
+
+template <class DeviceType>
+SwapLocalCaps PairLJCutKokkos<DeviceType>::swap_local_caps(std::string &reason) const
+{
+  SwapLocalCaps caps = {1, 1, cutforce, cutforce};
+  if (typeid(*this) != typeid(PairLJCutKokkos<DeviceType>)) {
+    caps.supported = 0;
+    reason = "derived pair style has not been validated for local swap energies";
+  } else if (!allocated || (cutforce <= 0.0)) {
+    caps.supported = 0;
+    reason = "pair coefficients are not initialized";
+  } else if (tail_flag) {
+    caps.supported = 0;
+    reason = "pair_modify tail yes is not supported";
+  }
+  return caps;
+}
+
+template <class DeviceType> void PairLJCutKokkos<DeviceType>::swap_local_begin(NeighList *full_list)
+{
+  swap_list_kk = nullptr;
+  // A host fix can query this interface too.  Decline a list from another
+  // memory space so the caller can fall back to full energy evaluations.
+  if (!full_list || !full_list->kokkos || (full_list->execution_space != execution_space)) return;
+  swap_list_kk = static_cast<NeighListKokkos<DeviceType> *>(full_list);
+  if (swap_centers_kk.setup(atom, swap_list_kk)) swap_list_kk = nullptr;
+  atomKK->sync(execution_space, X_MASK | TYPE_MASK | TAG_MASK);
+  k_params.template sync<DeviceType>();
+}
+
+template <class DeviceType> void PairLJCutKokkos<DeviceType>::swap_local_end()
+{ swap_list_kk = nullptr; }
+
+template <class DeviceType>
+int PairLJCutKokkos<DeviceType>::swap_local_delta_energy_batch(int n, const SwapProposal *proposals,
+                                                               double *dE) const
+{
+  if (!swap_list_kk) return 1;
+  if (!n) return 0;
+  atomKK->sync(execution_space, X_MASK | TYPE_MASK | TAG_MASK);
+  const auto sx = atomKK->k_x.template view<DeviceType>();
+  const auto stype = atomKK->k_type.template view<DeviceType>();
+  const auto stag = atomKK->k_tag.template view<DeviceType>();
+  swap_images_kk.stage(atom, n, proposals);
+  if ((int) d_swap_energy.extent(0) < n) {
+    d_swap_energy = decltype(d_swap_energy)("lj/cut:swap energy", n + n / 4 + 1);
+    h_swap_energy = decltype(h_swap_energy)("lj/cut:host swap energy", d_swap_energy.extent(0));
+  }
+  const auto energy = d_swap_energy;
+  const auto props = swap_images_kk.d_proposals;
+  const auto offset = swap_images_kk.d_img_offset;
+  const auto images = swap_images_kk.d_img_atom;
+  const auto slot = swap_images_kk.d_img_slot;
+  const auto first = swap_centers_kk.d_gfirst;
+  const auto gcenter = swap_centers_kk.d_gcenter;
+  const auto num = swap_list_kk->d_numneigh;
+  const auto neighbors = swap_list_kk->d_neighbors;
+  const auto coeff = k_params.template view<DeviceType>();
+  const int owned = atom->nlocal;
+  // Pairwise independent edits can share an unedited site.  Sum only the
+  // changed pair terms of each proposal, so such sites need no shared stamp.
+  Kokkos::parallel_for(
+      "lj/cut:swap owned energies", Kokkos::RangePolicy<DeviceType>(0, n), KOKKOS_LAMBDA(int k) {
+        const SwapProposal p = props(k);
+        double de = 0.0;
+        for (int im = offset(k); im < offset(k + 1); ++im) {
+          const int a = images(im);
+          const int m = slot(im);
+          const int told = p.oldtype[m];
+          const int tnew = p.newtype[m];
+          if (a < owned) {
+            for (int jj = 0; jj < num(a); ++jj) {
+              const int j = neighbors(a, jj) & NEIGHMASK;
+              const double dx = sx(a, 0) - sx(j, 0);
+              const double dy = sx(a, 1) - sx(j, 1);
+              const double dz = sx(a, 2) - sx(j, 2);
+              const double rsq = dx * dx + dy * dy + dz * dz;
+              const int jo = swap_kk_oldtype(p, stag(j), stype(j));
+              const int jn = swap_kk_newtype(p, stag(j), stype(j));
+              de += 0.5 * (coeff(tnew, jn).swap_energy(rsq) - coeff(told, jo).swap_energy(rsq));
+            }
+          }
+          const int start = (a < owned) ? 0 : first(a - owned);
+          const int end = (a < owned) ? num(a) : first(a - owned + 1);
+          for (int jj = start; jj < end; ++jj) {
+            const int c = (a < owned) ? (neighbors(a, jj) & NEIGHMASK) : gcenter(jj);
+            if ((c >= owned) || (swap_kk_which(p, stag(c)) >= 0)) continue;
+            const double dx = sx(c, 0) - sx(a, 0);
+            const double dy = sx(c, 1) - sx(a, 1);
+            const double dz = sx(c, 2) - sx(a, 2);
+            const double rsq = dx * dx + dy * dy + dz * dz;
+            const int tc = stype(c);
+            de += 0.5 * (coeff(tc, tnew).swap_energy(rsq) - coeff(tc, told).swap_energy(rsq));
+          }
+        }
+        energy(k) = de;
+      });
+  Kokkos::deep_copy(Kokkos::subview(h_swap_energy, Kokkos::pair<int, int>(0, n)),
+                    Kokkos::subview(d_swap_energy, Kokkos::pair<int, int>(0, n)));
+  for (int k = 0; k < n; ++k) dE[k] = h_swap_energy(k);
+  return 0;
 }
 
 namespace LAMMPS_NS {

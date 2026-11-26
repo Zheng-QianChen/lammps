@@ -180,6 +180,8 @@ action fix_addforce_kokkos.cpp
 action fix_addforce_kokkos.h
 action fix_addtorque_group_kokkos.cpp fix_addtorque_group.cpp
 action fix_addtorque_group_kokkos.h fix_addtorque_group.h
+action fix_atom_swap_kokkos.cpp fix_atom_swap.cpp
+action fix_atom_swap_kokkos.h fix_atom_swap.h
 action fix_aveforce_kokkos.cpp
 action fix_aveforce_kokkos.h
 action fix_addtorque_atom_kokkos.cpp fix_addtorque_atom.cpp
@@ -722,6 +724,7 @@ action pair_sw_angle_table_kokkos.cpp pair_sw_angle_table.cpp
 action pair_sw_angle_table_kokkos.h pair_sw_angle_table.h
 action pair_sw_kokkos.cpp pair_sw.cpp
 action pair_sw_kokkos.h pair_sw.h
+action pair_swap_local_kokkos.h
 action pair_table_kokkos.cpp
 action pair_table_kokkos.h
 action pair_table_rx_kokkos.cpp pair_table_rx.cpp

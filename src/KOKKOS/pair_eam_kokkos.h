@@ -27,6 +27,7 @@ PairStyle(eam/kk/host,PairEAMKokkos<LMPHostType>);
 #include "pair_kokkos.h"
 #include "pair_eam.h"
 #include "neigh_list_kokkos.h"
+#include "pair_swap_local_kokkos.h"
 
 namespace LAMMPS_NS {
 
@@ -144,6 +145,16 @@ class PairEAMKokkos : public PairEAM, public KokkosBase {
   int pack_reverse_comm(int, int, double *) override;
   void unpack_reverse_comm(int, int *, double *) override;
 
+  // local energy changes for atom type swaps (device owner-computes)
+
+  PairSwapLocal *swap_local() override;
+  SwapLocalCaps swap_local_caps(std::string &) const override;
+  void swap_local_begin(class NeighList *) override;
+  int swap_local_delta_energy_batch(int, const SwapProposal *, double *) const override;
+  void swap_local_commit(const SwapProposal &) override;
+  void swap_local_commit_batch(int, const SwapProposal *, const int *) override;
+  void swap_local_end() override;
+
  protected:
   typename AT::t_kkfloat_1d_3_lr x;
   typename AT::t_kkacc_1d_3 f;
@@ -246,6 +257,17 @@ class PairEAMKokkos : public PairEAM, public KokkosBase {
 
   int neighflag,newton_pair;
   int nlocal,nall,eflag,vflag;
+
+  // device buffers for lazy owner-computes local type swaps
+
+  NeighListKokkos<DeviceType> *swap_list_kk = nullptr;
+  SwapLocalCentersKokkos<DeviceType> swap_centers_kk;
+  mutable SwapBatchImagesKokkos<DeviceType> swap_images_kk;
+  mutable SwapLocalAffectedKokkos<DeviceType> swap_affected_kk;
+  mutable Kokkos::View<double *, DeviceType> d_swap_energy;
+  mutable Kokkos::View<double *, LMPPinnedHostType> h_swap_energy;
+  mutable Kokkos::View<double *, DeviceType> d_swap_rho;
+  mutable Kokkos::View<int *, DeviceType> d_swap_rho_valid;
 
   friend void pair_virial_fdotr_compute<PairEAMKokkos>(PairEAMKokkos*);
 };

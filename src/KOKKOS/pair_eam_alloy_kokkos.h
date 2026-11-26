@@ -29,6 +29,7 @@ namespace LAMMPS_NS {
 template <class DeviceType> class PairEAMAlloyKokkos : public PairEAMKokkos<DeviceType> {
  public:
   PairEAMAlloyKokkos(class LAMMPS *);
+  PairSwapLocal *swap_local() override;
 };
 
 }    // namespace LAMMPS_NS

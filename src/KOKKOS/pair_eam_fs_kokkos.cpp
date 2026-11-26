@@ -17,6 +17,8 @@
 
 #include "pair_eam_fs_kokkos.h"
 
+#include <typeinfo>
+
 using namespace LAMMPS_NS;
 
 /* ---------------------------------------------------------------------- */
@@ -26,6 +28,18 @@ PairEAMFSKokkos<DeviceType>::PairEAMFSKokkos(LAMMPS *lmp) : PairEAMKokkos<Device
 {
   this->fileformat = PairEAM::FS;
   this->one_coeff = 1;
+}
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps, see pair_swap_local.h
+   uses the PairEAMKokkos implementation.  only enabled for this exact class,
+   derived classes must opt in explicitly.
+------------------------------------------------------------------------- */
+
+template <class DeviceType> PairSwapLocal *PairEAMFSKokkos<DeviceType>::swap_local()
+{
+  if (typeid(*this) != typeid(PairEAMFSKokkos<DeviceType>)) return nullptr;
+  return this;
 }
 
 namespace LAMMPS_NS {

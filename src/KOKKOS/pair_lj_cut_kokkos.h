@@ -26,6 +26,7 @@ PairStyle(lj/cut/kk/host,PairLJCutKokkos<LMPHostType>);
 #include "pair_kokkos.h"
 #include "pair_lj_cut.h"
 #include "neigh_list_kokkos.h"
+#include "pair_swap_local_kokkos.h"
 
 namespace LAMMPS_NS {
 
@@ -43,6 +44,13 @@ class PairLJCutKokkos : public PairLJCut {
 
   void compute(int, int) override;
 
+  PairSwapLocal *swap_local() override;
+  SwapLocalCaps swap_local_caps(std::string &) const override;
+  void swap_local_begin(NeighList *) override;
+  int swap_local_delta_energy_batch(int, const SwapProposal *, double *) const override;
+  void swap_local_commit(const SwapProposal &) override {}
+  void swap_local_end() override;
+
   void init_style() override;
   double init_one(int, int) override;
 
@@ -54,6 +62,15 @@ class PairLJCutKokkos : public PairLJCut {
     KOKKOS_INLINE_FUNCTION
     params_lj(int /*i*/) {cutsq=0,lj1=0;lj2=0;lj3=0;lj4=0;offset=0;};
     KK_FLOAT cutsq,lj1,lj2,lj3,lj4,offset;
+    // NOLINTNEXTLINE
+    KOKKOS_INLINE_FUNCTION
+    double swap_energy(double rsq) const
+    {
+      if (rsq >= cutsq) return 0.0;
+      const double r2inv = 1.0 / rsq;
+      const double r6inv = r2inv * r2inv * r2inv;
+      return r6inv * (lj3 * r6inv - lj4) - offset;
+    }
   };
 
  protected:
@@ -93,6 +110,12 @@ class PairLJCutKokkos : public PairLJCut {
   DAT::ttransform_kkfloat_2d k_cutsq;
   typename AT::t_kkfloat_2d d_cutsq;
 
+
+  NeighListKokkos<DeviceType> *swap_list_kk = nullptr;
+  SwapLocalCentersKokkos<DeviceType> swap_centers_kk;
+  mutable SwapBatchImagesKokkos<DeviceType> swap_images_kk;
+  mutable Kokkos::View<double *, DeviceType> d_swap_energy;
+  mutable Kokkos::View<double *, LMPPinnedHostType> h_swap_energy;
 
   int neighflag;
   int nlocal,nall,eflag,vflag;
