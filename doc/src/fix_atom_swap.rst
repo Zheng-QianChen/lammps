@@ -1,5 +1,4 @@
 .. index:: fix atom/swap
-
 fix atom/swap command
 =====================
 
@@ -13,11 +12,13 @@ Syntax
 * ID, group-ID are documented in :doc:`fix <fix>` command
 * atom/swap = style name of this fix command
 * N = invoke this fix every N steps
-* X = number of swaps to attempt every N steps
+* X = number of swap attempts per invocation in serial mode, or rounds per
+  color in checkerboard mode
 * seed = random # seed (positive integer)
 * T = scaling temperature of the MC swaps (temperature units)
 * one or more keyword/value pairs may be appended to args
-* keyword = *types* or *mu* or *ke* or *semi-grand* or *region*
+* keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *energy*
+  or *rmax* or *proposal* or *parallel*
 
   .. parsed-literal::
 
@@ -31,6 +32,26 @@ Syntax
          *yes* = semi-grand canonical ensemble, particle fractions not conserved
        *region* value = region-ID
          region-ID = ID of region to use as an exchange/move volume
+       *energy* value = *auto* or *local* or *full* or *verify*
+         *auto* = use local energy changes if possible, else full energies
+         *local* = use local energy changes, stop with an error if not possible
+         *full* = compute the full potential energy for every attempt
+         *verify* = use local energy changes and compare them to full energies
+       *rmax* value = distance
+         distance = max distance of two swapped atoms (distance units),
+           0.0 = no limit
+       *proposal* values = *hetero* or *geometric* keyword args
+         *hetero* = select pairs of atoms of different type with
+           equal probability
+         *geometric* = select pairs of atoms with equal probability
+         zero or one keyword/args pair may be appended to *geometric*
+         *weights* args = itype jtype w ...
+           itype,jtype = two different swap types (1-Ntypes or type label)
+           w = relative probability to attempt a selected pair of these types
+       *parallel* value = *serial* or *checkerboard*
+         *serial* = attempt swaps one after the other
+         *checkerboard* = attempt swaps in many cells of a checkerboard
+           grid at the same time
 
 Examples
 """"""""
@@ -40,6 +61,10 @@ Examples
    fix 2 all atom/swap 1 1 29494 300.0 ke no types 1 2
    fix myFix all atom/swap 100 1 12345 298.0 region my_swap_region types 5 6
    fix SGMC all atom/swap 1 100 345 1.0 semi-grand yes types 1 2 3 mu 0.0 4.3 -5.0
+   fix mc all atom/swap 10 20 12345 800.0 types 1 2 rmax 2.5 &
+     energy local parallel checkerboard
+   fix mc all atom/swap 10 500 12345 800.0 types 1 2 3 &
+     proposal geometric weights 1 2 1.0 2 3 0.5
 
 Description
 """""""""""
@@ -48,8 +73,8 @@ This fix performs Monte Carlo swaps of atoms of one given atom type with
 atoms of the other given atom types.  The specified scaling temperature
 *T* is used in the Metropolis criterion dictating swap probabilities.
 
-Perform *X* swaps of atoms of one type with atoms of another type
-according to a Monte Carlo probability.  Swap candidates must be in
+In serial mode, make *X* swap attempts between atoms of different
+types according to a Monte Carlo probability.  Swap candidates must be in
 the fix group, must be in the region (if specified), and must be of
 one of the listed types. Swaps are attempted between candidates that
 are chosen randomly with equal probability among the candidate
@@ -58,9 +83,9 @@ nothing would happen.
 
 All atoms in the simulation domain can also be moved using regular
 time integration displacements (e.g., via :doc:`fix nvt <fix_nh>`),
-resulting in a hybrid MC+MD simulation, where $X$ MC swap attempts are
-made once every $N$ MD steps.  A smaller-than-usual timestep size may
-be needed when running such a hybrid simulation, especially if the
+resulting in a hybrid MC+MD simulation.  In serial mode, *X* MC swap
+attempts are made once every *N* MD steps.  A smaller-than-usual timestep
+size may be needed when running such a hybrid simulation, especially if the
 swapped atoms are not well equilibrated.
 
 .. note::
@@ -73,7 +98,7 @@ swapped atoms are not well equilibrated.
 
 The *types* keyword is required. At least two atom types must be
 specified. If not using *semi-grand*, exactly two atom types are
-required.
+required, unless the *proposal* or *rmax* keyword is used.
 
 The *ke* keyword can be set to *no* to turn off kinetic energy
 conservation for swaps. The default is *yes*, which means that swapped
@@ -154,6 +179,120 @@ individual :doc:`fix <fix>` commands specify if this should be done.
 
 ----------
 
+Local energy changes and parallel sweeps
+""""""""""""""""""""""""""""""""""""""""
+
+.. versionadded:: TBD
+
+The keywords *energy*, *rmax*, *proposal*, and *parallel* enable
+extensions of this fix.  Without any of these keywords, the fix behaves
+exactly as described above: full potential energies are computed for
+every attempt and the global output vector has length 2.
+
+The *parallel* keyword defaults to *serial*.  Checkerboard sweeps are
+optional and must be selected with *parallel checkerboard*.
+
+The *energy* keyword selects how the energy change of a swap attempt is
+computed.  With *full*, the total potential energy of the system is
+computed after each attempted swap as described above, which takes a
+time proportional to the number of atoms for every attempt.  With
+*local*, the energy change is computed from the finite-range
+neighborhood of atoms whose energies are affected by the swapped
+atoms.  This is exact (up to floating-point round-off).  The evaluation
+cost scales with that affected neighborhood rather than with the total
+number of atoms, while neighbor-list construction, proposal selection,
+and communication of energy contributions still add overhead.  Each MPI
+process computes the change of the energies of the atoms it owns, and
+these changes are summed over all processes.  With *auto* (the default
+when one of the extension keywords is used), local energy changes are
+used when possible, and otherwise the fix prints a warning with the
+reason and uses full energies.  With *local*, the fix stops with an
+error instead.  With *verify*, local energy changes are used, but also
+compared to full energy evaluations.  The largest absolute difference
+between the local and full energy changes is available as the fourth
+element of the output vector.  This is meant for testing and is slower
+than *full*.  If the pair style cannot compute a local energy change
+during a run, the fix stops with an error for *local* and *verify*,
+while with *auto* it prints a warning and uses full energies for the
+rest of that invocation.
+
+Local energy changes are currently available for the pair style :doc:`lj/cut <pair_lj>`.
+These local energy calculations require that the potential energy comes
+from the pair style only: no kspace style, no bonded interactions, and no
+fixes that contribute to the potential energy (via :doc:`fix_modify energy
+yes <fix_modify>`).  On molecular systems, special bond factors other than
+1.0 are also not allowed; atomic systems are unaffected by that restriction.
+They further require no neighbor list exclusions or include groups, no
+*pair_modify tail yes*, no per-atom masses, :doc:`comm_style brick
+<comm_style>` with a single communication cutoff, neighbor style *bin* or
+*nsq*, and no :doc:`run_style respa <run_style>`.
+The ghost atom cutoff must be at
+least the larger of *rmax* and the dependency radius, which is the
+distance up to which the energy of an atom depends on the type of
+another atom.  For *lj/cut* this is the largest pair cutoff.
+
+The *rmax* keyword limits swaps to pairs of eligible atoms within the
+distance *rmax* of each other.  It cannot be used with *semi-grand yes*.
+The value of *rmax* must not exceed the communication cutoff (see
+:doc:`comm_modify cutoff <comm_modify>`), which is also checked during
+a run.  The *rmax* keyword cannot be used together with neighbor list
+exclusions (see :doc:`neigh_modify exclude <neigh_modify>`), since
+pairs of excluded atoms would never be swapped.
+
+The *proposal* keyword selects how pairs of atoms are chosen for swap
+attempts with *semi-grand no*.  The default without *proposal* and
+*rmax* chooses a random atom of the first and of the second listed type
+and requires exactly two types.  With *hetero*, pairs of eligible atoms
+of different type (within *rmax* if set) are chosen with equal
+probability, and more than two types may be listed.  When *rmax* is
+used, the number of such pairs changes with the composition around the
+swapped atoms, which is accounted for by a Hastings correction of the
+acceptance probability.  With *geometric*, all pairs of eligible atoms
+(within *rmax* if set) are chosen with equal probability.  Pairs of
+atoms of the same type then result in a null move, which is counted in
+the third element of the output vector.  The optional *weights* keyword
+of *geometric* selection sets the probability :math:`w/w_{\max}` with
+which a selected pair of the two given types is attempted, where
+:math:`w_{\max}` is the largest of all weights.  The default weight is
+1.0 for all pairs of different types.  If *rmax* is used without the
+*proposal* keyword, *hetero* selection is used.
+
+The *parallel* keyword selects how swaps are attempted.  With *serial*
+(the default), the *X* swap attempts are made one after the other.  With
+*checkerboard*, the periodic simulation box is divided into a grid of
+:math:`n_x \times n_y \times n_z` cells with an even number
+:math:`n \ge 2` of cells in each dimension.  Each cell is wider than the
+larger of *rmax* and the conflict radius, the distance within which two
+swaps can affect each other's energy change (the largest pair cutoff
+for *lj/cut*).  The grid is shifted by a random offset at each
+invocation.  The cells are colored
+in 8 colors like a 3d checkerboard, so cells of the same color do not
+touch.  Each invocation visits the eight colors once, in forward or
+reverse order with equal probability.  For each color, *X* rounds are
+made.  In each round, every cell of that color selects at most one pair
+of atoms that are both inside the cell with the *hetero* or *geometric*
+selection rule, and all these swaps are evaluated and accepted or
+rejected at the same time.  These swaps do not affect each other's
+energy change.  A cell in which only a single pair can be selected makes
+a null move with probability 1/2, which prevents the swap of such a pair
+from alternating with a period of two attempts.  Empty cells, same-type
+draws, weight-rejected pairs, and those single-pair 1/2 self-loops are
+null moves and still count as attempts.  Checkerboard draws are keyed
+by the random seed, the timestep, the sweep, the color, the cell, and
+the attempt, so all MPI processes make the same decisions for pairs of
+atoms owned by different processes.  Each cell counts as one attempt in
+each round, so each invocation makes *X* times the total number of cells
+attempts.
+Checkerboard sweeps require local energy changes, *semi-grand no*,
+*rmax* > 0.0, and a 3d box that is periodic in all dimensions and large
+enough for at least 2 cells in each dimension.  Otherwise the fix prints
+a warning and makes *X* serial swap attempts in that invocation, which
+are far fewer attempts than a checkerboard sweep with the same *X*.
+Since the box can change during a run, these conditions are checked at
+every invocation.
+
+----------
+
 Dump image info
 """""""""""""""
 
@@ -191,7 +330,10 @@ seed, the next timestep for MC exchanges, the number of exchange
 attempts and successes, etc.  See the :doc:`read_restart <read_restart>`
 command for info on how to re-specify a fix in an input script that
 reads a restart file, so that the operation of the fix continues in an
-uninterrupted fashion.
+uninterrupted fashion.  The number of null moves and the largest
+difference between local and full energy changes (third and fourth
+elements of the extended output vector) are not stored in restart files
+and start again from 0 after a restart.
 
 .. note::
 
@@ -209,6 +351,22 @@ the following global cumulative quantities:
 
   #. swap attempts
   #. swap accepts
+
+.. versionchanged:: TBD
+
+If any of the keywords *energy*, *rmax*, *proposal*, or *parallel* is
+used, including *energy full* or *parallel serial*, the vector has
+length 4 with these values:
+
+  #. swap attempts (cumulative)
+  #. swap accepts (cumulative)
+  #. null moves (cumulative count of attempts that do not evaluate a
+     different-type swap: same-type draws, weight-rejected pairs,
+     empty checkerboard cells, and single-pair cells that take a 1/2
+     self-loop)
+  #. largest absolute difference between local and full energy changes
+     (energy units); 0.0 when *energy verify* is not used; not a
+     cumulative sum
 
 The vector values calculated by this fix are "intensive".
 
@@ -244,7 +402,11 @@ Default
 """""""
 
 The option defaults are *ke* = yes, *semi-grand* = no, *mu* = 0.0 for
-all atom types.
+all atom types, *rmax* = 0.0, and *parallel* = serial.  The default for
+*energy* is *full* if none of the keywords *energy*, *rmax*, *proposal*,
+or *parallel* is used, and *auto* otherwise.  For canonical swaps without
+the *proposal* keyword, a random atom of each of the first two listed
+types is selected if *rmax* = 0.0, and *hetero* selection is used otherwise.
 
 ----------
 
