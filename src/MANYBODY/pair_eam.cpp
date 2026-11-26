@@ -25,13 +25,39 @@
 #include "memory.h"
 #include "neighbor.h"
 #include "neigh_list.h"
+#include "pair_swap_local.h"
 #include "potential_file_reader.h"
 #include "update.h"
 
 #include <cmath>
 #include <cstring>
+#include <typeinfo>
 
 using namespace LAMMPS_NS;
+
+// clang-format on
+
+namespace LAMMPS_NS {
+// per-invocation data for local energy changes of atom type swaps
+class SwapLocalEAM {
+ public:
+  NeighList *list = nullptr;               // full neighbor list of owned atoms
+  SwapLocalCenters centers;                // owned atoms near owned or ghost atoms
+  std::vector<double> rho;                 // cached density of owned atoms
+  std::vector<unsigned char> rho_valid;    // 1 if rho of an owned atom is set
+  SwapLocalStamp stamp;                    // scratch: set of touched owned atoms
+  std::vector<int> slot;                   // scratch: index of touched owned atom in touched
+  std::vector<int> touched;                // scratch: unedited owned atoms with changes
+  std::vector<double> drho;                // scratch: their density changes
+  std::vector<double> dpair;               // scratch: their pair energy changes
+  std::vector<int> edited;                 // scratch: owned images of edited atoms
+  std::vector<double> rhonew;              // scratch: their new densities
+  SwapProposal cached;                     // proposal the scratch data belongs to
+  int cached_valid = 0;                    // 1 if the scratch data is valid
+};
+}    // namespace LAMMPS_NS
+
+// clang-format off
 
 /* ---------------------------------------------------------------------- */
 
@@ -68,6 +94,8 @@ PairEAM::PairEAM(LAMMPS *lmp) : Pair(lmp), type2rhor(nullptr), type2z2r(nullptr)
   rhor_spline = nullptr;
   z2r_spline = nullptr;
 
+  swaplocal = nullptr;
+
   // set comm size needed by this Pair
 
   comm_forward = 1;
@@ -81,6 +109,8 @@ PairEAM::PairEAM(LAMMPS *lmp) : Pair(lmp), type2rhor(nullptr), type2z2r(nullptr)
 PairEAM::~PairEAM()
 {
   if (copymode) return;
+
+  delete swaplocal;
 
   memory->destroy(rho);
   memory->destroy(fp);
@@ -1701,4 +1731,342 @@ void *PairEAM::extract_peratom(const char *str, int &ncol)
   }
 
   return nullptr;
+}
+
+// clang-format on
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps, see pair_swap_local.h
+   valid for eam, eam/alloy, eam/fs and eam/he, which share compute().
+   only enabled for these exact classes (see the overrides of swap_local()
+   in the derived classes), all other derived classes must opt in explicitly.
+------------------------------------------------------------------------- */
+
+PairSwapLocal *PairEAM::swap_local()
+{
+  if (typeid(*this) != typeid(PairEAM)) return nullptr;
+  return this;
+}
+
+/* ----------------------------------------------------------------------
+   return 1 if swap_local() of the actual class enables local energies
+------------------------------------------------------------------------- */
+
+int PairEAM::swaplocal_supported_class() const
+{
+  auto *self = const_cast<PairEAM *>(this);
+  return (self->swap_local() == static_cast<PairSwapLocal *>(self)) ? 1 : 0;
+}
+
+/* ----------------------------------------------------------------------
+   site energy E_c = F_c(rho_c) + 1/2 sum_j phi_cj(r_cj) depends on the types
+   of atoms within cutmax.  two edits interact through the non-linear
+   embedding energy of a shared neighbor, so the conflict radius is 2*cutmax.
+------------------------------------------------------------------------- */
+
+SwapLocalCaps PairEAM::swap_local_caps(std::string &reason) const
+{
+  SwapLocalCaps caps;
+  caps.supported = 1;
+  caps.supports_charge = 1;    // energy does not depend on charges
+  caps.dependency_radius = cutmax;
+  caps.conflict_radius = 2.0 * cutmax;
+
+  if (!swaplocal_supported_class()) {
+    caps.supported = 0;
+    reason = "derived pair style has not been validated for local swap energies";
+  } else if (!allocated || !frho_spline || !rhor_spline || !z2r_spline || (cutmax <= 0.0)) {
+    caps.supported = 0;
+    reason = "potential tables are not initialized";
+  } else {
+    for (int i = 1; i <= atom->ntypes; i++) {
+      if ((map[i] < 0) || (type2frho[i] < 0)) {
+        caps.supported = 0;
+        reason = "atom types mapped to NULL are not supported";
+        break;
+      }
+    }
+  }
+  return caps;
+}
+
+/* ----------------------------------------------------------------------
+   set up the density cache of owned atoms.  densities are computed on
+   first use from the full neighbor list.  rho, fp and numforce of the pair
+   style are neither read nor written.
+------------------------------------------------------------------------- */
+
+void PairEAM::swap_local_begin(NeighList *full_list)
+{
+  delete swaplocal;
+  swaplocal = new SwapLocalEAM;
+  const int nlocal = atom->nlocal;
+  swaplocal->list = full_list;
+  if (swaplocal->centers.setup(atom, full_list)) swaplocal->list = nullptr;
+  swaplocal->rho.assign(nlocal, 0.0);
+  swaplocal->rho_valid.assign(nlocal, 0);
+  swaplocal->slot.assign(nlocal, -1);
+  swaplocal->stamp.resize(nlocal);
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairEAM::swap_local_end()
+{
+  delete swaplocal;
+  swaplocal = nullptr;
+}
+
+/* ----------------------------------------------------------------------
+   embedding energy of an atom of type itype with density rhoi, identical to
+   compute_embedding() including the linear extrapolation beyond the table
+   ends and the scale factor
+------------------------------------------------------------------------- */
+
+double PairEAM::swaplocal_embed(int itype, double rhoi) const
+{
+  int m;
+  double p;
+  embedding_index(rhoi, m, p);
+  const double *coeff = frho_spline[type2frho[itype]][m];
+  const double fpi = (coeff[0] * p + coeff[1]) * p + coeff[2];
+  double phi = ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+  if (he_flag && (rhoi < rhomin))
+    phi += fpi * (rhoi - rhomin);
+  else if (rhoi > rhomax)
+    phi += fpi * (rhoi - rhomax);
+  return phi * scale[itype][itype];
+}
+
+/* ----------------------------------------------------------------------
+   density of owned atom i before proposal prop from its full neighbor list.
+   types of edited atoms are taken from prop.
+------------------------------------------------------------------------- */
+
+double PairEAM::swaplocal_rho_compute(int i, const SwapProposal &prop) const
+{
+  const double *const *const x = atom->x;
+  const int *const type = atom->type;
+  const tagint *const tag = atom->tag;
+  const int itype = swap_local_oldtype(prop, tag[i], type[i]);
+  const double xtmp = x[i][0];
+  const double ytmp = x[i][1];
+  const double ztmp = x[i][2];
+  const int *jlist = swaplocal->list->firstneigh[i];
+  const int jnum = swaplocal->list->numneigh[i];
+  double rhoi = 0.0;
+
+  for (int jj = 0; jj < jnum; jj++) {
+    const int j = jlist[jj] & NEIGHMASK;
+    const double delx = xtmp - x[j][0];
+    const double dely = ytmp - x[j][1];
+    const double delz = ztmp - x[j][2];
+    const double rsq = delx * delx + dely * dely + delz * delz;
+    if (rsq < cutforcesq) {
+      double p = sqrt(rsq) * rdr + 1.0;
+      int m = static_cast<int>(p);
+      m = MIN(m, nr - 1);
+      p -= m;
+      p = MIN(p, 1.0);
+      const int jtype = swap_local_oldtype(prop, tag[j], type[j]);
+      const double *coeff = rhor_spline[type2rhor[jtype][itype]][m];
+      rhoi += ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+    }
+  }
+  return rhoi;
+}
+
+/* ----------------------------------------------------------------------
+   cached density of owned atom i before proposal prop, computed on first use
+------------------------------------------------------------------------- */
+
+double PairEAM::swaplocal_rho_get(int i, const SwapProposal &prop) const
+{
+  if (!swaplocal->rho_valid[i]) {
+    swaplocal->rho[i] = swaplocal_rho_compute(i, prop);
+    swaplocal->rho_valid[i] = 1;
+  }
+  return swaplocal->rho[i];
+}
+
+/* ----------------------------------------------------------------------
+   owner computes energy change of one proposal for the owned atoms c of
+   this rank with site energies E_c = F_c(rho_c) + 1/2 sum_j phi_cj(r_cj):
+   - owned images of edited atoms: new density and pair terms from their
+     full neighbor list (densities of eam/fs depend on the own type)
+   - unedited owned atoms c near a local or ghost image a of an edited
+     atom: density and 1/2 pair energy changes of the pair c-a, once per
+     image, so atoms near several images are exact
+   results are left in the scratch data.  with energy = 0 only the
+   density changes are computed (for swap_local_commit()).
+------------------------------------------------------------------------- */
+
+void PairEAM::swaplocal_core(const SwapProposal &prop, double &de, int energy) const
+{
+  const double *const *const x = atom->x;
+  const int *const type = atom->type;
+  const tagint *const tag = atom->tag;
+  const int *const sametag = atom->sametag;
+  const int nlocal = atom->nlocal;
+  const int *const numneigh = swaplocal->list->numneigh;
+  int **const firstneigh = swaplocal->list->firstneigh;
+  SwapLocalEAM &data = *swaplocal;
+
+  data.stamp.reset();
+  data.touched.clear();
+  data.drho.clear();
+  data.dpair.clear();
+  data.edited.clear();
+  data.rhonew.clear();
+  data.cached_valid = 0;
+  de = 0.0;
+
+  for (int s = 0; s < prop.count; s++) {
+    const int told = prop.oldtype[s];
+    const int tnew = prop.newtype[s];
+
+    for (int a = atom->map(prop.tag[s]); a >= 0; a = sametag[a]) {
+      const double xa = x[a][0];
+      const double ya = x[a][1];
+      const double za = x[a][2];
+
+      // owned image of an edited atom: recompute density and pair terms
+
+      if (a < nlocal) {
+        const int *jlist = firstneigh[a];
+        const int jnum = numneigh[a];
+        double rhoa = 0.0;
+        double epair = 0.0;
+        for (int jj = 0; jj < jnum; jj++) {
+          const int j = jlist[jj] & NEIGHMASK;
+          const double delx = xa - x[j][0];
+          const double dely = ya - x[j][1];
+          const double delz = za - x[j][2];
+          const double rsq = delx * delx + dely * dely + delz * delz;
+          if (rsq >= cutforcesq) continue;
+
+          const int w = swap_local_which(prop, tag[j]);
+          const int jold = (w < 0) ? type[j] : prop.oldtype[w];
+          const int jnew = (w < 0) ? type[j] : prop.newtype[w];
+          const double r = sqrt(rsq);
+          double p = r * rdr + 1.0;
+          int m = static_cast<int>(p);
+          m = MIN(m, nr - 1);
+          p -= m;
+          p = MIN(p, 1.0);
+
+          const double *coeff = rhor_spline[type2rhor[jnew][tnew]][m];
+          rhoa += ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+          if (energy) {
+            const double recip = 1.0 / r;
+            coeff = z2r_spline[type2z2r[tnew][jnew]][m];
+            const double phinew = ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+            coeff = z2r_spline[type2z2r[told][jold]][m];
+            const double phiold = ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+            epair += 0.5 * (scale[tnew][jnew] * phinew - scale[told][jold] * phiold) * recip;
+          }
+        }
+        data.edited.push_back(a);
+        data.rhonew.push_back(rhoa);
+        if (energy)
+          de += epair + swaplocal_embed(tnew, rhoa) -
+              swaplocal_embed(told, swaplocal_rho_get(a, prop));
+      }
+
+      // unedited owned atoms with image a in their list
+
+      data.centers.for_each(a, [&](int c) {
+        if (swap_local_which(prop, tag[c]) >= 0) return;
+        const double delx = x[c][0] - xa;
+        const double dely = x[c][1] - ya;
+        const double delz = x[c][2] - za;
+        const double rsq = delx * delx + dely * dely + delz * delz;
+        if (rsq >= cutforcesq) return;
+
+        if (data.stamp.insert(c)) {
+          data.slot[c] = data.touched.size();
+          data.touched.push_back(c);
+          data.drho.push_back(0.0);
+          data.dpair.push_back(0.0);
+        }
+        const int n = data.slot[c];
+        const int tc = type[c];
+        const double r = sqrt(rsq);
+        double p = r * rdr + 1.0;
+        int m = static_cast<int>(p);
+        m = MIN(m, nr - 1);
+        p -= m;
+        p = MIN(p, 1.0);
+
+        const double *coeff = rhor_spline[type2rhor[tnew][tc]][m];
+        const double fnew = ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+        coeff = rhor_spline[type2rhor[told][tc]][m];
+        const double fold = ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+        data.drho[n] += fnew - fold;
+        if (energy) {
+          coeff = z2r_spline[type2z2r[tc][tnew]][m];
+          const double phinew = ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+          coeff = z2r_spline[type2z2r[tc][told]][m];
+          const double phiold = ((coeff[3] * p + coeff[4]) * p + coeff[5]) * p + coeff[6];
+          data.dpair[n] += 0.5 * (scale[tc][tnew] * phinew - scale[tc][told] * phiold) / r;
+        }
+      });
+    }
+  }
+
+  // embedding energy changes of unedited owned atoms
+
+  if (energy) {
+    for (std::size_t n = 0; n < data.touched.size(); n++) {
+      const int c = data.touched[n];
+      const double rhoc = swaplocal_rho_get(c, prop);
+      de += data.dpair[n] + swaplocal_embed(type[c], rhoc + data.drho[n]) -
+          swaplocal_embed(type[c], rhoc);
+    }
+  }
+}
+
+/* ----------------------------------------------------------------------
+   the scratch data of a single proposal is kept, so swap_local_commit()
+   of the same proposal does not need to repeat the calculation
+------------------------------------------------------------------------- */
+
+int PairEAM::swap_local_delta_energy_batch(int n, const SwapProposal *proposals, double *dE) const
+{
+  if (!swaplocal || !swaplocal->list) return 1;
+  for (int k = 0; k < n; k++) swaplocal_core(proposals[k], dE[k], 1);
+  if (n == 1) {
+    swaplocal->cached = proposals[0];
+    swaplocal->cached_valid = 1;
+  }
+  return 0;
+}
+
+/* ----------------------------------------------------------------------
+   update the density cache of owned atoms after an accepted proposal.
+   cached densities that were not computed yet are computed later from the
+   then current types.
+------------------------------------------------------------------------- */
+
+void PairEAM::swap_local_commit(const SwapProposal &accepted)
+{
+  if (!swaplocal || !swaplocal->list)
+    error->one(FLERR, Error::NOLASTLINE, "Pair style {} could not update local swap data",
+               force->pair_style);
+
+  SwapLocalEAM &data = *swaplocal;
+  if (!data.cached_valid || !swap_local_same_types(data.cached, accepted)) {
+    double de;
+    swaplocal_core(accepted, de, 0);
+  }
+
+  for (std::size_t n = 0; n < data.edited.size(); n++) {
+    data.rho[data.edited[n]] = data.rhonew[n];
+    data.rho_valid[data.edited[n]] = 1;
+  }
+  for (std::size_t n = 0; n < data.touched.size(); n++) {
+    const int c = data.touched[n];
+    if (data.rho_valid[c]) data.rho[c] += data.drho[n];
+  }
+  data.cached_valid = 0;
 }

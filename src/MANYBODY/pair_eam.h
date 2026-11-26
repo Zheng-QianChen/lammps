@@ -21,10 +21,11 @@ PairStyle(eam,PairEAM);
 #define LMP_PAIR_EAM_H
 
 #include "pair.h"
+#include "pair_swap_local.h"
 
 namespace LAMMPS_NS {
 
-class PairEAM : public Pair {
+class PairEAM : public Pair, public PairSwapLocal {
  public:
   friend class FixSemiGrandCanonicalMC;    // Alex Stukowski option
 
@@ -62,6 +63,15 @@ class PairEAM : public Pair {
   void unpack_reverse_comm(int, int *, double *) override;
   double memory_usage() override;
   void swap_eam(double *, double **) override;
+
+  // local energy changes for atom type swaps
+
+  PairSwapLocal *swap_local() override;
+  SwapLocalCaps swap_local_caps(std::string &) const override;
+  void swap_local_begin(class NeighList *) override;
+  int swap_local_delta_energy_batch(int, const SwapProposal *, double *) const override;
+  void swap_local_commit(const SwapProposal &) override;
+  void swap_local_end() override;
 
  protected:
   int nmax;    // allocated size of per-atom arrays
@@ -180,6 +190,17 @@ class PairEAM : public Pair {
   // table format so the format test is hoisted out of the loop
 
   template <int HE> void compute_embedding(int, int &);
+
+  // data for local energy changes of atom type swaps.  only a pointer, so
+  // that copies made by derived accelerator styles stay cheap
+
+  class SwapLocalEAM *swaplocal;
+
+  int swaplocal_supported_class() const;
+  double swaplocal_embed(int, double) const;
+  double swaplocal_rho_compute(int, const SwapProposal &) const;
+  double swaplocal_rho_get(int, const SwapProposal &) const;
+  void swaplocal_core(const SwapProposal &, double &, int) const;
 };
 
 }    // namespace LAMMPS_NS

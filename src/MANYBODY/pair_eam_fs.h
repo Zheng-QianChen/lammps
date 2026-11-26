@@ -27,6 +27,7 @@ namespace LAMMPS_NS {
 class PairEAMFS : public PairEAM {
  public:
   PairEAMFS(class LAMMPS *);
+  PairSwapLocal *swap_local() override;
 };
 
 }    // namespace LAMMPS_NS

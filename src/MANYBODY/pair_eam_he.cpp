@@ -17,11 +17,23 @@
 
 #include "pair_eam_he.h"
 
+#include <typeinfo>
+
 using namespace LAMMPS_NS;
 
 /* ---------------------------------------------------------------------- */
 
 PairEAMHE::PairEAMHE(LAMMPS *lmp) : PairEAMFS(lmp)
+{ he_flag = 1; }
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps, see pair_swap_local.h
+   uses the PairEAM implementation.  only enabled for this exact class,
+   derived classes must opt in explicitly.
+------------------------------------------------------------------------- */
+
+PairSwapLocal *PairEAMHE::swap_local()
 {
-  he_flag = 1;
+  if (typeid(*this) != typeid(PairEAMHE)) return nullptr;
+  return this;
 }

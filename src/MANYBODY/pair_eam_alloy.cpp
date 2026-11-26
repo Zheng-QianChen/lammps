@@ -17,6 +17,8 @@
 
 #include "pair_eam_alloy.h"
 
+#include <typeinfo>
+
 using namespace LAMMPS_NS;
 
 /* ---------------------------------------------------------------------- */
@@ -25,4 +27,16 @@ PairEAMAlloy::PairEAMAlloy(LAMMPS *lmp) : PairEAM(lmp)
 {
   fileformat = SETFL;
   one_coeff = 1;
+}
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps, see pair_swap_local.h
+   uses the PairEAM implementation.  only enabled for this exact class,
+   derived classes must opt in explicitly.
+------------------------------------------------------------------------- */
+
+PairSwapLocal *PairEAMAlloy::swap_local()
+{
+  if (typeid(*this) != typeid(PairEAMAlloy)) return nullptr;
+  return this;
 }

@@ -17,6 +17,8 @@
 
 #include "pair_eam_fs.h"
 
+#include <typeinfo>
+
 using namespace LAMMPS_NS;
 
 /* ---------------------------------------------------------------------- */
@@ -25,4 +27,16 @@ PairEAMFS::PairEAMFS(LAMMPS *lmp) : PairEAM(lmp)
 {
   fileformat = FS;
   one_coeff = 1;
+}
+
+/* ----------------------------------------------------------------------
+   local energy changes for atom type swaps, see pair_swap_local.h
+   uses the PairEAM implementation.  only enabled for this exact class,
+   derived classes must opt in explicitly.
+------------------------------------------------------------------------- */
+
+PairSwapLocal *PairEAMFS::swap_local()
+{
+  if (typeid(*this) != typeid(PairEAMFS)) return nullptr;
+  return this;
 }
