@@ -12,9 +12,10 @@
 ------------------------------------------------------------------------- */
 
 // unit tests for fix atom/swap: legacy behavior, local energy changes from
-// lj/cut, checkerboard sweeps across MPI sub-domains, the conditions for
-// local energy changes, optionality of extension keywords, and shrink-wrap
-// / dynamic triclinic NPT regressions.  can be run with any number of MPI ranks.
+// lj/cut, eam and meam pair styles, checkerboard sweeps across MPI
+// sub-domains, the conditions for local energy changes, optionality of
+// extension keywords, and shrink-wrap / dynamic triclinic NPT regressions.
+// can be run with any number of MPI ranks.
 
 #include "MC/fix_atom_swap.h"
 #include "atom.h"
@@ -39,6 +40,9 @@
 #include <cmath>
 #include <utility>
 
+#define STRINGIFY(val) XSTR(val)
+#define XSTR(val) #val
+
 using ::testing::HasSubstr;
 using ::testing::Not;
 
@@ -54,6 +58,17 @@ using Lines = std::vector<std::string>;
 const int NPAIRS           = 64;
 const double PAIRS_LATTICE = 6.0;
 const double PAIRS_BOX     = 24.0;
+
+// return path of a potential file or an empty string if it cannot be read
+std::string potential_file(const std::string &name)
+{
+#if defined(TEST_POTENTIALS_FOLDER)
+    const std::string path = std::string(STRINGIFY(TEST_POTENTIALS_FOLDER)) + "/" + name;
+    if (platform::file_is_readable(path)) return path;
+#endif
+    // fall back to the current directory and the LAMMPS_POTENTIALS folder
+    return utils::get_potential_file_path(name);
+}
 
 // binary fcc lattice with lj/cut and unequal per-type cutoffs
 Lines lj_fcc(int n, const std::string &newton = "on", const std::string &style = "atomic")
@@ -334,6 +349,143 @@ TEST_F(FixAtomSwapTest, lj_cut_verify)
     EXPECT_LT(fix_vector("mc", 3), EPS_VERIFY);
     EXPECT_GT(fix_vector("sg", 1), 0.0);
     EXPECT_LT(fix_vector("sg", 3), EPS_VERIFY);
+}
+
+// 3: eam/alloy, eam/fs and eam/he.  eam/cd has no local energy changes.
+
+TEST_F(FixAtomSwapTest, eam_verify)
+{
+    struct EAMCase {
+        std::string style, file, elements, mode;
+        double lattice;
+        int n;
+    };
+    const std::vector<EAMCase> cases = {
+        {"eam/alloy", "CuNi.eam.alloy", "Ni Cu", "serial", 3.56, 3},
+        {"eam/alloy", "CuNi.eam.alloy", "Ni Cu", "checkerboard", 3.56, 8},
+        {"eam/fs", "AlFe_mm.eam.fs", "Al Fe", "serial", 4.05, 3},
+        {"eam/he", "PdHHe.eam.he", "Pd He", "serial", 3.89, 3}};
+
+    int ntested = 0;
+    for (const auto &c : cases) {
+        SCOPED_TRACE(c.style + " " + c.mode);
+        if (!has_style("pair", c.style)) continue;
+        const auto file = potential_file(c.file);
+        if (file.empty()) continue;
+        reset();
+        auto out = run({"units metal", "atom_style atomic", "atom_modify map array",
+                        fmt::format("lattice fcc {}", c.lattice),
+                        fmt::format("region box block 0 {0} 0 {0} 0 {0}", c.n), "create_box 2 box",
+                        "create_atoms 1 box", "mass * 50.0", "set type 1 type/fraction 2 0.5 4321",
+                        "displace_atoms all random 0.1 0.1 0.1 9876", "pair_style " + c.style,
+                        fmt::format("pair_coeff * * {} {}", file, c.elements),
+                        fmt::format("fix mc all atom/swap 1 {} 12345 3000.0 types 1 2 rmax 3.0 "
+                                    "energy verify parallel {}",
+                                    (c.mode == "checkerboard") ? 1 : 10, c.mode),
+                        "run 2 post no"});
+        EXPECT_GT(fix_vector("mc", 0), 0.0);
+        EXPECT_GT(fix_vector("mc", 1), 0.0);
+        EXPECT_LT(fix_vector("mc", 3), EPS_VERIFY);
+        if (me == 0) {
+            EXPECT_THAT(out, HasSubstr("using local energy changes from pair style " + c.style));
+            if (c.mode == "checkerboard") {
+                EXPECT_THAT(out, HasSubstr("using checkerboard sweeps"));
+            }
+        }
+        ++ntested;
+    }
+
+    // eam/cd: error with energy local, full energies with energy auto
+
+    const auto cdfile = potential_file("FeCr.cdeam");
+    if (has_style("pair", "eam/cd") && !cdfile.empty()) {
+        const Lines setup = {"units metal",       "atom_style atomic",
+                             "lattice bcc 2.87",  "region box block 0 3 0 3 0 3",
+                             "create_box 2 box",  "create_atoms 1 box",
+                             "mass * 55.0",       "set type 1 type/fraction 2 0.3 4321",
+                             "pair_style eam/cd", "pair_coeff * * " + cdfile + " Fe Cr"};
+        reset();
+        Lines input = setup;
+        input.emplace_back("fix mc all atom/swap 1 2 12345 1000.0 types 1 2 rmax 3.0 energy local");
+        input.emplace_back("run 0 post no");
+        EXPECT_THAT(error_of(input),
+                    HasSubstr("pair style eam/cd does not support local swap energies"));
+
+        reset();
+        input = setup;
+        input.emplace_back("fix mc all atom/swap 1 2 12345 1000.0 types 1 2 rmax 3.0 energy auto");
+        input.emplace_back("run 1 post no");
+        auto out = run(input);
+        EXPECT_GT(fix_vector("mc", 0), 0.0);
+        if (me == 0) {
+            EXPECT_THAT(out, HasSubstr("using full energy evaluation"));
+        }
+        ++ntested;
+    }
+    if (ntested == 0) GTEST_SKIP() << "No EAM pair style or potential file available";
+}
+
+// 4: meam, and no local energy changes when screening atoms are outside the
+// neighbor list cutoff (neighbor skin 0.0)
+
+TEST_F(FixAtomSwapTest, meam_verify)
+{
+    if (!has_style("pair", "meam")) GTEST_SKIP() << "Pair style meam is not available";
+    const auto library = potential_file("library.meam");
+    const auto param   = potential_file("SiC.meam");
+    if (library.empty() || param.empty()) GTEST_SKIP() << "MEAM potential files not found";
+
+    const Lines setup = {"units metal",
+                         "atom_style atomic",
+                         "atom_modify map array",
+                         "lattice diamond 4.36",
+                         "region box block 0 5 0 5 0 5",
+                         "create_box 2 box",
+                         "create_atoms 1 box",
+                         "mass 1 28.0855",
+                         "mass 2 12.011",
+                         "set type 1 type/fraction 2 0.5 4321",
+                         "displace_atoms all random 0.05 0.05 0.05 9876",
+                         "pair_style meam",
+                         "pair_coeff * * " + library + " Si C " + param + " Si C"};
+
+    for (const std::string mode : {"serial", "checkerboard"}) {
+        SCOPED_TRACE("parallel " + mode);
+        reset();
+        Lines input = setup;
+        input.emplace_back(fmt::format("fix mc all atom/swap 1 {} 12345 5000.0 types 1 2 rmax 2.5 "
+                                       "energy verify parallel {}",
+                                       (mode == "checkerboard") ? 1 : 20, mode));
+        input.emplace_back("run 1 post no");
+        auto out = run(input);
+        EXPECT_GT(fix_vector("mc", 0), 0.0);
+        EXPECT_GT(fix_vector("mc", 1), 0.0);
+        EXPECT_LT(fix_vector("mc", 3), EPS_VERIFY);
+        if (me == 0) {
+            EXPECT_THAT(out, HasSubstr("using local energy changes from pair style meam"));
+            if (mode == "checkerboard") {
+                EXPECT_THAT(out, HasSubstr("using checkerboard sweeps"));
+            }
+        }
+    }
+
+    reset();
+    Lines input = setup;
+    input.emplace_back("neighbor 0.0 bin");
+    input.emplace_back("fix mc all atom/swap 1 2 12345 5000.0 types 1 2 rmax 2.5 energy local");
+    input.emplace_back("run 0 post no");
+    EXPECT_THAT(error_of(input), HasSubstr("are not all inside the neighbor list cutoff"));
+
+    reset();
+    input = setup;
+    input.emplace_back("neighbor 0.0 bin");
+    input.emplace_back("fix mc all atom/swap 1 2 12345 5000.0 types 1 2 rmax 2.5 energy auto");
+    input.emplace_back("run 1 post no");
+    auto out = run(input);
+    EXPECT_GT(fix_vector("mc", 0), 0.0);
+    if (me == 0) {
+        EXPECT_THAT(out, HasSubstr("using full energy evaluation"));
+    }
 }
 
 // checkerboard swaps of pairs of atoms owned by different MPI ranks are

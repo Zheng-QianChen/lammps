@@ -216,7 +216,9 @@ during a run, the fix stops with an error for *local* and *verify*,
 while with *auto* it prints a warning and uses full energies for the
 rest of that invocation.
 
-Local energy changes are currently available for the pair style :doc:`lj/cut <pair_lj>`.
+Local energy changes are currently available for the
+pair styles :doc:`lj/cut <pair_lj>`, :doc:`eam, eam/alloy, eam/fs, and
+eam/he <pair_eam>`, and :doc:`meam <pair_meam>` (but not MS-MEAM).
 These local energy calculations require that the potential energy comes
 from the pair style only: no kspace style, no bonded interactions, and no
 fixes that contribute to the potential energy (via :doc:`fix_modify energy
@@ -229,7 +231,12 @@ They further require no neighbor list exclusions or include groups, no
 The ghost atom cutoff must be at
 least the larger of *rmax* and the dependency radius, which is the
 distance up to which the energy of an atom depends on the type of
-another atom.  For *lj/cut* this is the largest pair cutoff.
+another atom.  This is the largest pair cutoff for lj/cut and eam
+styles.  For pair style meam, it is :math:`\sqrt{C_{bound}}\, r_c` with
+the largest bounding ellipse parameter :math:`C_{bound}` of the
+screening function of all pairs of elements.  All atoms that can screen
+a pair must then be within the neighbor list cutoff (pair cutoff plus
+neighbor skin), otherwise local energy changes are not used.
 
 The *rmax* keyword limits swaps to pairs of eligible atoms within the
 distance *rmax* of each other.  It cannot be used with *semi-grand yes*.
@@ -263,10 +270,11 @@ The *parallel* keyword selects how swaps are attempted.  With *serial*
 :math:`n_x \times n_y \times n_z` cells with an even number
 :math:`n \ge 2` of cells in each dimension.  Each cell is wider than the
 larger of *rmax* and the conflict radius, the distance within which two
-swaps can affect each other's energy change (the largest pair cutoff
-for *lj/cut*).  The grid is shifted by a random offset at each
-invocation.  The cells are colored
-in 8 colors like a 3d checkerboard, so cells of the same color do not
+swaps can affect each other's energy change (twice the dependency radius
+for eam and meam styles, the largest pair cutoff for lj/cut).
+The grid is shifted by a random offset at each invocation.  The cells
+are colored in 8 colors like a 3d checkerboard, so cells of the same
+color do not
 touch.  Each invocation visits the eight colors once, in forward or
 reverse order with equal probability.  For each color, *X* rounds are
 made.  In each round, every cell of that color selects at most one pair
