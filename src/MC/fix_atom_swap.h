@@ -140,6 +140,8 @@ class FixAtomSwap : public Fix {
   int comm_mode;                      // COMM_TYPEQ or COMM_FLAG
   int map_temporary;                  // 1 if the atom map was created by this fix
   int local_active;                   // 1 between swap_local_begin() and swap_local_end()
+  int swap_hooks_active;              // 1 between swap_begin_hooks() and swap_end_hooks()
+  int hooks_invoked;                  // 1 after pre_exchange_begin_hook() until its end hook
   int energy_valid;                   // 1 if energy_stored is the current full energy
 
   double nswap_null;       // # of attempts that ended as null (empty) moves
@@ -184,14 +186,19 @@ class FixAtomSwap : public Fix {
   ColorCells color_cells[8];
   int cb_dims[3];    // checkerboard grid
 
-  // local energy and proposal operations
+  // hooks for accelerated variants
 
-  class PairSwapLocal *local_pair_interface();
-  int swap_eval_batch(int, const SwapProposal *, double *);
-  void swap_commit_batch(int, const SwapProposal *, const int *);
-  void swap_apply_accepted(int, const SwapProposal *, const int *);
-  void swap_forward_comm();
-  void request_swap_list(double);
+  virtual class PairSwapLocal *local_pair_interface();
+  virtual void swap_begin_hooks() {}
+  virtual void swap_end_hooks() {}
+  virtual int swap_eval_batch(int, const SwapProposal *, double *);
+  virtual void swap_commit_batch(int, const SwapProposal *, const int *);
+  virtual void swap_apply_accepted(int, const SwapProposal *, const int *);
+  virtual void swap_forward_comm();
+  virtual void pre_exchange_begin_hook() {}
+  virtual void pre_exchange_end_hook() {}
+  virtual void request_swap_list(double);
+  virtual void swap_apply_trial_hook(const SwapProposal & /*p*/, int /*flag*/) {}
 
   // extension methods
 

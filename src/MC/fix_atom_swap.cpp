@@ -169,6 +169,8 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   comm_mode = COMM_TYPEQ;
   map_temporary = 0;
   local_active = 0;
+  swap_hooks_active = 0;
+  hooks_invoked = 0;
   energy_valid = 0;
   nswap_null = 0.0;
   verify_maxdev = 0.0;
@@ -230,6 +232,7 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
 
 FixAtomSwap::~FixAtomSwap()
 {
+  if (copymode) return;
   memory->destroy(type_list);
   memory->destroy(mu);
   memory->destroy(qtype);
@@ -687,7 +690,7 @@ void FixAtomSwap::init_list(int /*id*/, NeighList *ptr)
 }
 
 /* ----------------------------------------------------------------------
-   local pair energy and proposal operations
+   hooks for local energy changes, may be replaced by accelerated variants
 ------------------------------------------------------------------------- */
 
 PairSwapLocal *FixAtomSwap::local_pair_interface()
@@ -907,6 +910,10 @@ void FixAtomSwap::local_eval_failed()
     local_active = 0;
     pair_local->swap_local_end();
   }
+  if (swap_hooks_active) {
+    swap_hooks_active = 0;
+    swap_end_hooks();
+  }
   local_now = 0;
 
   // neighbor lists were not updated after swaps with local energy changes
@@ -1015,6 +1022,8 @@ void FixAtomSwap::pre_exchange()
     }
   };
   ScopeExit<decltype(cleanup)> guard(cleanup);
+  hooks_invoked = 1;
+  pre_exchange_begin_hook();
 
   // ensure current system is ready to compute energy
   // Refresh box-dependent communication and bins before exchanging atoms.
@@ -1103,6 +1112,8 @@ void FixAtomSwap::pre_exchange()
     }
     if (local_now || (rmax > 0.0)) neighbor->build_one(swap_list);
     if (local_now) {
+      swap_begin_hooks();
+      swap_hooks_active = 1;
       pair_local->swap_local_begin(swap_list);
       local_active = 1;
     }
@@ -1170,12 +1181,20 @@ void FixAtomSwap::end_mc_invocation()
     local_active = 0;
     pair_local->swap_local_end();
   }
+  if (swap_hooks_active) {
+    swap_hooks_active = 0;
+    swap_end_hooks();
+  }
   if (map_temporary) {
     atom->map_delete();
     atom->map_style = Atom::MAP_NONE;
     map_temporary = 0;
   }
 
+  if (hooks_invoked) {
+    hooks_invoked = 0;
+    pre_exchange_end_hook();
+  }
   mc_active = 0;
 }
 
@@ -1844,6 +1863,7 @@ void FixAtomSwap::set_proposal_types(const SwapProposal &p, int flag)
       if (atom->q_flag && p.qflag) q[a] = qm;
     }
   }
+  swap_apply_trial_hook(p, flag);
 }
 
 /* ----------------------------------------------------------------------
