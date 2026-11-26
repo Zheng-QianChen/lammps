@@ -23,7 +23,7 @@ parenthesis: g = GPU, i = INTEL, k = KOKKOS, o = OPENMP, t = OPT.
    * :doc:`amoeba/bitorsion <fix_amoeba_bitorsion>`
    * :doc:`amoeba/pitorsion <fix_amoeba_pitorsion>`
    * :doc:`append/atoms <fix_append_atoms>`
-   * :doc:`atom/swap <fix_atom_swap>`
+   * :doc:`atom/swap (k) <fix_atom_swap>`
    * :doc:`atom_weight/apip <fix_atom_weight_apip>`
    * :doc:`ave/atom <fix_ave_atom>`
    * :doc:`ave/chunk <fix_ave_chunk>`

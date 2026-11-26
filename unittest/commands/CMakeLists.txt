@@ -303,12 +303,184 @@ target_link_libraries(test_input_validation PRIVATE lammps GTest::GMock)
 add_test(NAME InputValidation COMMAND test_input_validation)
 add_kokkos_test(NAME InputValidation COMMAND test_input_validation)
 
-# Regression tests for fix atom/swap with changing boxes.
+# tests for fix atom/swap of the MC package, also with multiple MPI ranks
 if(PKG_MC)
   add_executable(test_fix_atom_swap test_fix_atom_swap.cpp)
-  target_link_libraries(test_fix_atom_swap PRIVATE lammps GTest::GMock)
   target_compile_definitions(test_fix_atom_swap PRIVATE -DTEST_POTENTIALS_FOLDER=${LAMMPS_POTENTIALS_DIR})
+  target_link_libraries(test_fix_atom_swap PRIVATE lammps GTest::GMock)
   add_test(NAME FixAtomSwap COMMAND test_fix_atom_swap)
+  # The MPI fixture constructs LAMMPS directly and does not consume
+  # LAMMPS_ACCELERATOR_ARGS.  Exercise the accelerated path through lmp,
+  # including an assertion on the local/full energy comparison.
+  # This version always builds lmp; honor BUILD_EXE if a parent defines it.
+  if(NOT DEFINED BUILD_EXE)
+    set(BUILD_EXE ON)
+  endif()
+  if(PKG_KOKKOS AND BUILD_EXE)
+    # Request one GPU for GPU backends and one thread for host backends.
+    if(Kokkos_ENABLE_CUDA OR Kokkos_ENABLE_HIP OR Kokkos_ENABLE_SYCL OR Kokkos_ENABLE_OPENMPTARGET)
+      set(swap_kokkos_cli_args -k on g 1 t 1 -sf kk)
+    else()
+      set(swap_kokkos_cli_args -k on t 1 -sf kk)
+    endif()
+    # Reduced precision pair tables do not satisfy the double precision tolerance.
+    string(TOLOWER "${KOKKOS_PREC}" swap_kokkos_precision)
+    if(swap_kokkos_precision STREQUAL "double")
+      set(swap_kokkos_verify_quit [[if "$(f_mc[1]) <= 0 || $(f_mc[4]) >= 1.0e-10" then "quit 1"]])
+    else()
+      set(swap_kokkos_verify_quit [[if "$(f_mc[1]) <= 0" then "quit 1"]])
+    endif()
+
+    # Omitted extension keywords retain full energies and a two-element vector.
+    set(swap_kokkos_legacy_input "${CMAKE_CURRENT_BINARY_DIR}/in.fix_atom_swap_legacy_full")
+    file(GENERATE OUTPUT "${swap_kokkos_legacy_input}" CONTENT
+[=[
+units lj
+atom_style atomic
+lattice sc 0.8
+region box block 0 8 0 8 0 8
+create_box 2 box
+create_atoms 1 box
+set type 1 type/fraction 2 0.5 4321
+mass * 1.0
+pair_style lj/cut 2.5
+pair_coeff 1 1 1.0 1.0
+pair_coeff 2 2 0.8 1.0
+pair_coeff 1 2 0.3 1.0
+neighbor 0.3 bin
+velocity all create 1.5 7777 loop geom
+fix integrate all nve
+fix mc all atom/swap 1 5 12345 1.5 types 1 2 ke yes
+variable size vector f_mc*0.0+1.0
+thermo_style custom step pe f_mc[1] f_mc[2]
+run 2
+if "$(sum(v_size)) != 2 || $(f_mc[1]) != 10" then "quit 1"
+if "$(f_mc[2]) <= 0 || $(f_mc[2]) >= $(f_mc[1])" then "quit 1"
+]=])
+    add_kokkos_test(NAME FixAtomSwapLegacyFull COMMAND ${LAMMPS_TEST_LAUNCHER} $<TARGET_FILE:lmp>
+                    ${swap_kokkos_cli_args}
+                    -pk kokkos newton on neigh half gpu/aware off
+                    -in "${swap_kokkos_legacy_input}" -log none)
+
+    # lj/cut/kk: valid (newton on, neigh half) and (newton off, neigh full)
+    set(swap_kokkos_input "${CMAKE_CURRENT_BINARY_DIR}/in.fix_atom_swap_kokkos")
+    set(swap_kokkos_lj_content
+[=[
+units lj
+atom_style atomic
+lattice fcc 0.8
+region box block 0 8 0 8 0 8
+create_box 2 box
+create_atoms 1 box
+set type 1 type/fraction 2 0.35 12345
+mass 1 1.0
+mass 2 1.8
+pair_style lj/cut 3.0
+pair_coeff 1 1 1.0 1.0 2.0
+pair_coeff 2 2 1.2 1.0 3.0
+pair_coeff 1 2 0.7 1.0 2.5
+pair_modify shift yes
+neighbor 0.5 bin
+comm_modify cutoff 3.6
+velocity all create 1.5 7777
+fix integrate all nve
+fix mc all atom/swap 1 2 20261126 1.5 types 1 2 ke yes rmax 1.8 proposal hetero energy verify parallel checkerboard
+thermo_style custom step pe f_mc[1] f_mc[2] f_mc[3] f_mc[4]
+run 2
+write_restart atom_swap_kokkos.restart
+run 2
+]=])
+    set(swap_kokkos_lj_content "${swap_kokkos_lj_content}${swap_kokkos_verify_quit}\n")
+    file(GENERATE OUTPUT "${swap_kokkos_input}" CONTENT "${swap_kokkos_lj_content}")
+    add_kokkos_test(NAME FixAtomSwap COMMAND ${LAMMPS_TEST_LAUNCHER} $<TARGET_FILE:lmp>
+                    ${swap_kokkos_cli_args}
+                    -pk kokkos newton on neigh half gpu/aware off
+                    -in "${swap_kokkos_input}" -log none)
+    add_kokkos_test(NAME FixAtomSwapFull COMMAND ${LAMMPS_TEST_LAUNCHER} $<TARGET_FILE:lmp>
+                    ${swap_kokkos_cli_args}
+                    -pk kokkos newton off neigh full gpu/aware off
+                    -in "${swap_kokkos_input}" -log none)
+
+    # Each dimension must fit at least two checkerboard cells.
+    if(PKG_MANYBODY AND EXISTS "${LAMMPS_POTENTIALS_DIR}/CuNi.eam.alloy")
+      set(swap_kokkos_eam_input "${CMAKE_CURRENT_BINARY_DIR}/in.fix_atom_swap_kokkos_eam")
+      set(swap_kokkos_eam_content
+"units metal
+atom_style atomic
+lattice fcc 3.56
+region box block 0 8 0 8 0 8
+create_box 2 box
+create_atoms 1 box
+set type 1 type/fraction 2 0.35 12345
+mass 1 58.6934
+mass 2 63.546
+pair_style eam/alloy
+pair_coeff * * \"${LAMMPS_POTENTIALS_DIR}/CuNi.eam.alloy\" Ni Cu
+neighbor 0.5 bin
+comm_modify cutoff 7.0
+fix integrate all nve
+fix mc all atom/swap 1 1 20261126 1200.0 types 1 2 rmax 3.0 proposal hetero energy verify parallel checkerboard
+thermo_style custom step pe f_mc[1] f_mc[2] f_mc[3] f_mc[4]
+run 1
+${swap_kokkos_verify_quit}
+")
+      file(GENERATE OUTPUT "${swap_kokkos_eam_input}" CONTENT "${swap_kokkos_eam_content}")
+      add_kokkos_test(NAME FixAtomSwapEAM COMMAND ${LAMMPS_TEST_LAUNCHER} $<TARGET_FILE:lmp>
+                      ${swap_kokkos_cli_args}
+                      -pk kokkos newton on neigh half gpu/aware off
+                      -in "${swap_kokkos_eam_input}" -log none
+                      ENVIRONMENT "LAMMPS_POTENTIALS=${LAMMPS_POTENTIALS_DIR}")
+    endif()
+
+    # MEAM requires newton on and a half neighbor list.
+    if(PKG_MEAM AND EXISTS "${LAMMPS_POTENTIALS_DIR}/library.meam" AND EXISTS "${LAMMPS_POTENTIALS_DIR}/SiC.meam")
+      set(swap_kokkos_meam_input "${CMAKE_CURRENT_BINARY_DIR}/in.fix_atom_swap_kokkos_meam")
+      set(swap_kokkos_meam_content
+"units metal
+atom_style atomic
+lattice diamond 4.36
+region box block 0 6 0 6 0 6
+create_box 2 box
+create_atoms 1 box
+set type 1 type/fraction 2 0.35 12345
+mass 1 28.0855
+mass 2 12.011
+pair_style meam
+pair_coeff * * \"${LAMMPS_POTENTIALS_DIR}/library.meam\" Si C \"${LAMMPS_POTENTIALS_DIR}/SiC.meam\" Si C
+neighbor 2.0 bin
+comm_modify cutoff 6.0
+fix integrate all nve
+fix mc all atom/swap 1 1 20261126 5000.0 types 1 2 rmax 2.5 proposal hetero energy verify parallel checkerboard
+thermo_style custom step pe f_mc[1] f_mc[2] f_mc[3] f_mc[4]
+run 1
+${swap_kokkos_verify_quit}
+")
+      file(GENERATE OUTPUT "${swap_kokkos_meam_input}" CONTENT "${swap_kokkos_meam_content}")
+      add_kokkos_test(NAME FixAtomSwapMEAM COMMAND ${LAMMPS_TEST_LAUNCHER} $<TARGET_FILE:lmp>
+                      ${swap_kokkos_cli_args}
+                      -pk kokkos newton on neigh half gpu/aware off
+                      -in "${swap_kokkos_meam_input}" -log none
+                      ENVIRONMENT "LAMMPS_POTENTIALS=${LAMMPS_POTENTIALS_DIR}")
+    endif()
+
+    # Exercise the same checkerboard energy check with two MPI ranks.
+    if(BUILD_MPI)
+      set(swap_kokkos_mpi_input "${CMAKE_CURRENT_BINARY_DIR}/in.fix_atom_swap_kokkos_mpi2")
+      string(REPLACE "run 2\nwrite_restart atom_swap_kokkos.restart\nrun 2\n" "run 1\n"
+             swap_kokkos_mpi_content "${swap_kokkos_lj_content}")
+      file(GENERATE OUTPUT "${swap_kokkos_mpi_input}" CONTENT "${swap_kokkos_mpi_content}")
+      add_mpi_test(NAME FixAtomSwapKokkosMPI2 NUM_PROCS 2
+                   COMMAND $<TARGET_FILE:lmp> ${swap_kokkos_cli_args}
+                   -pk kokkos newton on neigh half gpu/aware off
+                   -in "${swap_kokkos_mpi_input}" -log none)
+      if(TEST FixAtomSwapKokkosMPI2)
+        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/FixAtomSwapKokkosMPI2")
+        set_tests_properties(FixAtomSwapKokkosMPI2 PROPERTIES
+                             WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/FixAtomSwapKokkosMPI2")
+        set_property(TEST FixAtomSwapKokkosMPI2 APPEND PROPERTY LABELS "kokkos")
+      endif()
+    endif()
+  endif()
   add_mpi_test(NAME FixAtomSwapMPI2 NUM_PROCS 2 COMMAND $<TARGET_FILE:test_fix_atom_swap>)
   add_mpi_test(NAME FixAtomSwapMPI4 NUM_PROCS 4 COMMAND $<TARGET_FILE:test_fix_atom_swap>)
 endif()

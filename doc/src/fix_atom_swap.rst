@@ -1,6 +1,10 @@
 .. index:: fix atom/swap
+.. index:: fix atom/swap/kk
+
 fix atom/swap command
 =====================
+
+Accelerator Variants: *atom/swap/kk*
 
 Syntax
 """"""
@@ -218,7 +222,14 @@ rest of that invocation.
 
 Local energy changes are currently available for the
 pair styles :doc:`lj/cut <pair_lj>`, :doc:`eam, eam/alloy, eam/fs, and
-eam/he <pair_eam>`, and :doc:`meam <pair_meam>` (but not MS-MEAM).
+eam/he <pair_eam>`, and :doc:`meam <pair_meam>` (but not MS-MEAM).  They
+are also available with *atom/swap/kk* for *lj/cut/kk*, *eam/kk*,
+*eam/alloy/kk*, *eam/fs/kk*, *eam/he/kk*, and standard *meam/kk*.
+The KOKKOS package accelerates local energy changes and supports the same
+serial and multi-rank checkerboard sweeps.  GPU atomic reductions may
+introduce floating-point rounding differences in the last bits across runs,
+unlike the deterministic serial reduction on the host.  Other accelerated
+or derived styles, including *meam/ms/kk*, do not support local energy changes.
 These local energy calculations require that the potential energy comes
 from the pair style only: no kspace style, no bonded interactions, and no
 fixes that contribute to the potential energy (via :doc:`fix_modify energy
@@ -329,6 +340,10 @@ spheres, since the radius is set to zero internally.
 
 ----------
 
+.. include:: accel_styles.rst
+
+----------
+
 Restart, fix_modify, output, run start/stop, minimize info
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
@@ -387,7 +402,12 @@ Restrictions
 
 This fix is part of the MC package.  It is only enabled if LAMMPS was
 built with that package.  See the :doc:`Build package <Build_package>`
-doc page for more info.
+doc page for more info.  The *atom/swap/kk* variant requires the KOKKOS
+package, which supports only neighbor style *bin*.  Local energy changes
+with *atom/swap/kk* work with the neighbor list settings supported by
+the KOKKOS package (*neigh half* with *newton on* or *off*, *neigh full*
+with *newton off*); with *meam/kk* they require *newton on* and *neigh
+half*.
 
 When this fix is used with a :doc:`hybrid pair style <pair_hybrid>`
 system, only swaps between atom types of the same sub-style (or
